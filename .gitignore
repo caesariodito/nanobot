@@ -5,6 +5,7 @@
 *.pyc
 dist/
 build/
+bridge/node_modules/
 *.egg-info/
 *.egg
 *.pycs
