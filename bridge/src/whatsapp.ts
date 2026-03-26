@@ -13,6 +13,56 @@ import makeWASocket, {
   extractMessageContent as baileysExtractMessageContent,
 } from '@whiskeysockets/baileys';
 
+const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
+const NUMERIC_MENTION_RE = /(^|\s)@([+]?\d[\d\s().-]{3,25}\d)(?=$|\s|[!?,.:;])/g;
+const ME_MENTION_RE = /(^|\s)@me(?=$|\s|[!?,.:;])/gi;
+const NAME_MENTION_RE = /(^|\s)@([\p{L}][\p{L}\p{N}_.-]{1,31})(?=$|\s|[!?,.:;])/gu;
+
+type GroupMentionContext = {
+  participants: string[];
+  idToJid: Map<string, string>;
+  nameToJid: Map<string, string | null>;
+  cachedAt: number;
+};
+
+function digitsOnly(value: string): string {
+  return value.replace(/\D+/g, '');
+}
+
+function localPart(jid: string): string {
+  return jid.includes('@') ? jid.split('@')[0] : jid;
+}
+
+function normalizeName(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+type MentionReplacement = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+function mentionHandleFromJid(jid: string): string {
+  const lp = localPart(jid);
+  const digits = digitsOnly(lp);
+  return digits.length >= 5 ? digits : lp;
+}
+
+function applyReplacements(text: string, replacements: MentionReplacement[]): string {
+  if (replacements.length === 0) return text;
+
+  const sorted = [...replacements].sort((a, b) => b.start - a.start);
+  let out = text;
+  for (const r of sorted) {
+    out = `${out.slice(0, r.start)}${r.text}${out.slice(r.end)}`;
+  }
+  return out;
+}
+
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
@@ -44,6 +94,8 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private groupContextByJid = new Map<string, GroupMentionContext>();
+  private lastGroupSenderByJid = new Map<string, string>();
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -172,6 +224,13 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
         const wasMentioned = this.wasMentioned(msg);
+        if (isGroup && msg.key.remoteJid) {
+          const participantJid = typeof msg.key.participant === 'string' ? msg.key.participant : '';
+          const pushName = typeof msg.pushName === 'string' ? msg.pushName : undefined;
+          if (participantJid) {
+            this.learnGroupParticipant(msg.key.remoteJid, participantJid, pushName);
+          }
+        }
 
         this.options.onMessage({
           id: msg.key.id || '',
@@ -185,6 +244,241 @@ export class WhatsAppClient {
         });
       }
     });
+  }
+
+  private learnGroupParticipant(groupJid: string, participantJid: string, pushName?: string): void {
+    if (!groupJid.endsWith('@g.us')) return;
+    if (!participantJid || !participantJid.includes('@')) return;
+
+    this.lastGroupSenderByJid.set(groupJid, participantJid);
+
+    const cached = this.groupContextByJid.get(groupJid);
+    if (!cached) return;
+
+    const nextParticipants = cached.participants.includes(participantJid)
+      ? cached.participants
+      : [...cached.participants, participantJid];
+
+    const nextIdToJid = new Map(cached.idToJid);
+    const lp = localPart(participantJid);
+    const digits = digitsOnly(lp);
+    nextIdToJid.set(lp, participantJid);
+    if (digits.length >= 5) nextIdToJid.set(digits, participantJid);
+
+    const nextNameToJid = new Map(cached.nameToJid);
+    if (pushName) {
+      const key = normalizeName(pushName);
+      if (key) {
+        const prev = nextNameToJid.get(key);
+        if (prev === undefined) {
+          nextNameToJid.set(key, participantJid);
+        } else if (prev !== participantJid) {
+          nextNameToJid.set(key, null);
+        }
+      }
+    }
+
+    this.groupContextByJid.set(groupJid, {
+      participants: nextParticipants,
+      idToJid: nextIdToJid,
+      nameToJid: nextNameToJid,
+      cachedAt: Date.now(),
+    });
+  }
+
+  private async getGroupMentionContext(groupJid: string): Promise<GroupMentionContext | null> {
+    const cached = this.groupContextByJid.get(groupJid);
+    if (cached && Date.now() - cached.cachedAt < GROUP_CACHE_TTL_MS) {
+      return cached;
+    }
+
+    if (!this.sock || typeof this.sock.groupMetadata !== 'function') {
+      return cached || null;
+    }
+
+    try {
+      const md = await this.sock.groupMetadata(groupJid);
+      const participantsRaw = (md?.participants || []) as any[];
+      const participants = participantsRaw
+        .map((p) => p?.id || p?.jid)
+        .filter((v): v is string => typeof v === 'string' && v.length > 0);
+      if (cached?.participants?.length) {
+        for (const existing of cached.participants) {
+          if (!participants.includes(existing)) participants.push(existing);
+        }
+      }
+
+      const idToJid = new Map<string, string>();
+      const nameCandidates = new Map<string, Set<string>>();
+
+      const addNameCandidate = (name: string | undefined, jid: string) => {
+        if (!name) return;
+        const key = normalizeName(name);
+        if (!key) return;
+        if (!nameCandidates.has(key)) nameCandidates.set(key, new Set());
+        nameCandidates.get(key)!.add(jid);
+      };
+
+      for (const p of participantsRaw) {
+        const jid = p?.id || p?.jid;
+        if (!jid || typeof jid !== 'string') continue;
+
+        const lp = localPart(jid);
+        const digits = digitsOnly(lp);
+
+        idToJid.set(lp, jid);
+        if (digits.length >= 5) idToJid.set(digits, jid);
+
+        addNameCandidate(p?.name, jid);
+        addNameCandidate(p?.notify, jid);
+        addNameCandidate(p?.pushName, jid);
+        addNameCandidate(p?.verifiedName, jid);
+
+        const contact = this.sock?.contacts?.[jid];
+        if (contact) {
+          addNameCandidate(contact?.name, jid);
+          addNameCandidate(contact?.notify, jid);
+          addNameCandidate(contact?.verifiedName, jid);
+          addNameCandidate(contact?.short, jid);
+        }
+      }
+
+      if (cached?.nameToJid?.size) {
+        for (const [k, v] of cached.nameToJid.entries()) {
+          if (!v) continue;
+          if (!nameCandidates.has(k)) nameCandidates.set(k, new Set());
+          nameCandidates.get(k)!.add(v);
+        }
+      }
+
+      const nameToJid = new Map<string, string | null>();
+      for (const [k, v] of nameCandidates.entries()) {
+        if (v.size === 1) {
+          nameToJid.set(k, [...v][0]);
+        } else {
+          nameToJid.set(k, null); // ambiguous
+        }
+      }
+
+      const ctx: GroupMentionContext = {
+        participants,
+        idToJid,
+        nameToJid,
+        cachedAt: Date.now(),
+      };
+
+      this.groupContextByJid.set(groupJid, ctx);
+      return ctx;
+    } catch (err) {
+      console.warn('Failed to fetch group metadata for mention resolution:', err);
+      return cached || null;
+    }
+  }
+
+  private resolveNameMentionJid(handle: string, ctx: GroupMentionContext): string | null {
+    const key = normalizeName(handle);
+    if (!key) return null;
+
+    const exact = ctx.nameToJid.get(key);
+    if (exact !== undefined) return exact;
+
+    // Fallback: unique prefix match
+    let match: string | null = null;
+    for (const [k, v] of ctx.nameToJid.entries()) {
+      if (!v) continue;
+      if (!k.startsWith(key)) continue;
+      if (!match) {
+        match = v;
+      } else if (match !== v) {
+        return null; // ambiguous
+      }
+    }
+
+    return match;
+  }
+
+  private async buildOutboundTextPayload(
+    to: string,
+    text: string,
+  ): Promise<{ text: string; mentions?: string[] }> {
+    const mentions = new Set<string>();
+    const replacements: MentionReplacement[] = [];
+    const isGroup = to.endsWith('@g.us');
+    const groupCtx = isGroup ? await this.getGroupMentionContext(to) : null;
+
+    NUMERIC_MENTION_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = NUMERIC_MENTION_RE.exec(text)) !== null) {
+      const prefix = m[1] || '';
+      const raw = m[2];
+      const digits = digitsOnly(raw);
+      if (digits.length < 5) continue;
+
+      let jid: string | undefined;
+      if (groupCtx) {
+        jid = groupCtx.idToJid.get(digits);
+      }
+      if (!jid) {
+        jid = `${digits}@s.whatsapp.net`;
+      }
+
+      mentions.add(jid);
+
+      const atStart = m.index + prefix.length;
+      const atEnd = atStart + 1 + raw.length;
+      replacements.push({
+        start: atStart,
+        end: atEnd,
+        text: `@${mentionHandleFromJid(jid)}`,
+      });
+    }
+
+    if (groupCtx) {
+      ME_MENTION_RE.lastIndex = 0;
+      while ((m = ME_MENTION_RE.exec(text)) !== null) {
+        const prefix = m[1] || '';
+        const jid = this.lastGroupSenderByJid.get(to);
+        if (!jid) continue;
+
+        mentions.add(jid);
+
+        const atStart = m.index + prefix.length;
+        const atEnd = atStart + 3;
+        replacements.push({
+          start: atStart,
+          end: atEnd,
+          text: `@${mentionHandleFromJid(jid)}`,
+        });
+      }
+
+      NAME_MENTION_RE.lastIndex = 0;
+      while ((m = NAME_MENTION_RE.exec(text)) !== null) {
+        const prefix = m[1] || '';
+        const handle = m[2];
+
+        if (handle.toLowerCase() === 'me') continue;
+        // Ignore numeric-like tokens handled by numeric parser.
+        if (!Number.isNaN(Number(handle))) continue;
+
+        const jid = this.resolveNameMentionJid(handle, groupCtx);
+        if (!jid) continue;
+
+        mentions.add(jid);
+
+        const atStart = m.index + prefix.length;
+        const atEnd = atStart + 1 + handle.length;
+        replacements.push({
+          start: atStart,
+          end: atEnd,
+          text: `@${mentionHandleFromJid(jid)}`,
+        });
+      }
+    }
+
+    const rewrittenText = applyReplacements(text, replacements);
+    if (mentions.size === 0) return { text: rewrittenText };
+
+    return { text: rewrittenText, mentions: [...mentions] };
   }
 
   private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
@@ -255,7 +549,8 @@ export class WhatsAppClient {
       throw new Error('Not connected');
     }
 
-    await this.sock.sendMessage(to, { text });
+    const payload = await this.buildOutboundTextPayload(to, text);
+    await this.sock.sendMessage(to, payload);
   }
 
   async sendMedia(
