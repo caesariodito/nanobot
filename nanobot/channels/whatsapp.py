@@ -193,8 +193,18 @@ class WhatsAppChannel(BaseChannel):
             is_group = data.get("isGroup", False)
             was_mentioned = data.get("wasMentioned", False)
 
-            if is_group and getattr(self.config, "group_policy", "open") == "mention":
-                if not was_mentioned:
+            group_policy = getattr(self.config, "group_policy", "open")
+            if is_group:
+                dropped_by_policy = group_policy == "mention" and not was_mentioned
+                logger.info(
+                    "WA group inbound: chat_jid={} group_policy={} was_mentioned={} dropped={} message_id={}",
+                    sender,
+                    group_policy,
+                    was_mentioned,
+                    dropped_by_policy,
+                    message_id,
+                )
+                if dropped_by_policy:
                     return
 
             user_id = pn if pn else sender

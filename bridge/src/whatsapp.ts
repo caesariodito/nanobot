@@ -102,7 +102,18 @@ export class WhatsAppClient {
   }
 
   private normalizeJid(jid: string | undefined | null): string {
-    return (jid || '').split(':')[0];
+    const raw = (jid || '').trim();
+    if (!raw) return '';
+
+    // Canonical form for mention matching across variants:
+    // - 628xxx:12@s.whatsapp.net -> 628xxx
+    // - 628xxx@s.whatsapp.net    -> 628xxx
+    // - 242xxx:12@lid            -> 242xxx
+    // - 242xxx@lid               -> 242xxx
+    let v = raw;
+    if (v.includes('@')) v = v.split('@')[0];
+    if (v.includes(':')) v = v.split(':')[0];
+    return v;
   }
 
   private wasMentioned(msg: any): boolean {
