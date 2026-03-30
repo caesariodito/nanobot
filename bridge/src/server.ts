@@ -21,7 +21,14 @@ interface SendMediaCommand {
   fileName?: string;
 }
 
-type BridgeCommand = SendCommand | SendMediaCommand;
+interface MarkReadCommand {
+  type: 'mark_read';
+  chatId: string;
+  messageId: string;
+  participant?: string;
+}
+
+type BridgeCommand = SendCommand | SendMediaCommand | MarkReadCommand;
 
 interface BridgeMessage {
   type: 'message' | 'status' | 'qr' | 'error';
@@ -85,7 +92,8 @@ export class BridgeServer {
       try {
         const cmd = JSON.parse(data.toString()) as BridgeCommand;
         await this.handleCommand(cmd);
-        ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
+        const ackTo = cmd.type === 'mark_read' ? cmd.chatId : cmd.to;
+        ws.send(JSON.stringify({ type: 'sent', to: ackTo }));
       } catch (error) {
         console.error('Error handling command:', error);
         ws.send(JSON.stringify({ type: 'error', error: String(error) }));
@@ -110,6 +118,8 @@ export class BridgeServer {
       await this.wa.sendMessage(cmd.to, cmd.text);
     } else if (cmd.type === 'send_media') {
       await this.wa.sendMedia(cmd.to, cmd.filePath, cmd.mimetype, cmd.caption, cmd.fileName);
+    } else if (cmd.type === 'mark_read') {
+      await this.wa.markRead(cmd.chatId, cmd.messageId, cmd.participant);
     }
   }
 

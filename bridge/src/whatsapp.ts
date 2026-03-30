@@ -80,6 +80,7 @@ export interface InboundMessage {
   timestamp: number;
   isGroup: boolean;
   wasMentioned?: boolean;
+  participant?: string;
   media?: string[];
 }
 
@@ -235,8 +236,8 @@ export class WhatsAppClient {
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
         const wasMentioned = this.wasMentioned(msg);
+        const participantJid = isGroup && typeof msg.key.participant === 'string' ? msg.key.participant : '';
         if (isGroup && msg.key.remoteJid) {
-          const participantJid = typeof msg.key.participant === 'string' ? msg.key.participant : '';
           const pushName = typeof msg.pushName === 'string' ? msg.pushName : undefined;
           if (participantJid) {
             this.learnGroupParticipant(msg.key.remoteJid, participantJid, pushName);
@@ -250,7 +251,7 @@ export class WhatsAppClient {
           content: finalContent,
           timestamp: msg.messageTimestamp as number,
           isGroup,
-          ...(isGroup ? { wasMentioned } : {}),
+          ...(isGroup ? { wasMentioned, participant: participantJid } : {}),
           ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
         });
       }
@@ -562,6 +563,26 @@ export class WhatsAppClient {
 
     const payload = await this.buildOutboundTextPayload(to, text);
     await this.sock.sendMessage(to, payload);
+  }
+
+  async markRead(chatId: string, messageId: string, participant?: string): Promise<void> {
+    if (!this.sock) {
+      throw new Error('Not connected');
+    }
+
+    if (!chatId || !messageId) return;
+
+    const key: Record<string, unknown> = {
+      remoteJid: chatId,
+      id: messageId,
+      fromMe: false,
+    };
+
+    if (chatId.endsWith('@g.us') && participant) {
+      key.participant = participant;
+    }
+
+    await this.sock.readMessages([key]);
   }
 
   async sendMedia(

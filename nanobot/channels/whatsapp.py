@@ -27,6 +27,8 @@ class WhatsAppConfig(Base):
     bridge_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
+    group_policy_map: dict[str, Literal["open", "mention"]] = Field(default_factory=dict)
+    auto_read_groups: list[str] = Field(default_factory=list)
 
 
 class WhatsAppChannel(BaseChannel):
@@ -193,17 +195,47 @@ class WhatsAppChannel(BaseChannel):
             is_group = data.get("isGroup", False)
             was_mentioned = data.get("wasMentioned", False)
 
+            def _normalize_group_id(chat_jid: str) -> str:
+                base = chat_jid.split("@", 1)[0] if "@" in chat_jid else chat_jid
+                return base.split(":", 1)[0] if ":" in base else base
+
             group_policy = getattr(self.config, "group_policy", "open")
             if is_group:
-                dropped_by_policy = group_policy == "mention" and not was_mentioned
+                group_id = _normalize_group_id(sender)
+                group_policy_map = getattr(self.config, "group_policy_map", {}) or {}
+                effective_policy = group_policy_map.get(sender, group_policy_map.get(group_id, group_policy))
+
+                dropped_by_policy = effective_policy == "mention" and not was_mentioned
                 logger.info(
-                    "WA group inbound: chat_jid={} group_policy={} was_mentioned={} dropped={} message_id={}",
+                    "WA group inbound: chat_jid={} group_id={} group_policy={} was_mentioned={} dropped={} message_id={}",
                     sender,
-                    group_policy,
+                    group_id,
+                    effective_policy,
                     was_mentioned,
                     dropped_by_policy,
                     message_id,
                 )
+
+                auto_read_groups = set(getattr(self.config, "auto_read_groups", []) or [])
+                should_auto_read = (sender in auto_read_groups or group_id in auto_read_groups) and bool(message_id)
+                if should_auto_read and self._ws and self._connected:
+                    mark_read_payload = {
+                        "type": "mark_read",
+                        "chatId": sender,
+                        "messageId": message_id,
+                        "participant": data.get("participant", ""),
+                    }
+                    try:
+                        await self._ws.send(json.dumps(mark_read_payload, ensure_ascii=False))
+                        logger.debug("WA auto-read requested for chat_jid={} message_id={}", sender, message_id)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to send WA auto-read command for chat_jid={} message_id={}: {}",
+                            sender,
+                            message_id,
+                            e,
+                        )
+
                 if dropped_by_policy:
                     return
 

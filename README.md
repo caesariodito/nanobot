@@ -482,7 +482,12 @@ nanobot channels login whatsapp
   "channels": {
     "whatsapp": {
       "enabled": true,
-      "allowFrom": ["+1234567890"]
+      "allowFrom": ["+1234567890"],
+      "groupPolicy": "mention",
+      "groupPolicyMap": {
+        "120363425946407740": "open"
+      },
+      "autoReadGroups": ["120363425946407740"]
     }
   }
 }
@@ -498,6 +503,10 @@ nanobot channels login whatsapp
 nanobot gateway
 ```
 
+> `groupPolicy`: default group behavior (`"mention"` or `"open"`).
+> `groupPolicyMap`: per-group override map; key can be numeric group id (e.g. `120363...`) or full JID (`120363...@g.us`).
+> `autoReadGroups`: list of groups where inbound messages are marked as read automatically.
+>
 > WhatsApp bridge updates are not applied automatically for existing installations.
 > After upgrading nanobot, rebuild the local bridge with:
 > `rm -rf ~/.nanobot/bridge && nanobot channels login whatsapp`
