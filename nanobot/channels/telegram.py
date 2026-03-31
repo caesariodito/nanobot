@@ -12,7 +12,7 @@ from typing import Any, Literal
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -25,7 +25,17 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_STREAM_EDIT_SAFE_LEN = 3500  # Safer limit for streaming edits/fallback chunks
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+
+
+def _is_message_too_long_error(err: Exception) -> bool:
+    """Best-effort detection for Telegram message length errors."""
+    if isinstance(err, BadRequest):
+        msg = str(err).lower()
+        return "message_too_long" in msg or "message is too long" in msg
+    msg = str(err).lower()
+    return "message_too_long" in msg or "message is too long" in msg
 
 
 def _strip_md(s: str) -> str:
@@ -478,36 +488,107 @@ class TelegramChannel(BaseChannel):
                 logger.error("Error sending Telegram message: {}", e2)
                 raise
 
+    async def _flush_stream_chunks(
+        self,
+        chat_id: int,
+        buf: _StreamBuf,
+        thread_kwargs: dict | None = None,
+    ) -> None:
+        """Flush long streamed text as multiple Telegram messages safely."""
+        if not self._app or not buf.text:
+            return
+
+        chunks = split_message(buf.text, TELEGRAM_STREAM_EDIT_SAFE_LEN)
+        if not chunks:
+            return
+
+        first, rest = chunks[0], chunks[1:]
+        if buf.message_id is not None:
+            try:
+                html = _markdown_to_telegram_html(first)
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=buf.message_id,
+                    text=html,
+                    parse_mode="HTML",
+                    **(thread_kwargs or {}),
+                )
+            except Exception as e:
+                logger.debug("Chunked head edit failed (HTML), trying plain: {}", e)
+                try:
+                    await self._call_with_retry(
+                        self._app.bot.edit_message_text,
+                        chat_id=chat_id,
+                        message_id=buf.message_id,
+                        text=first,
+                        **(thread_kwargs or {}),
+                    )
+                except Exception as e2:
+                    logger.warning("Chunked head edit failed; sending as new message: {}", e2)
+                    await self._send_text(chat_id, first, None, thread_kwargs)
+        else:
+            await self._send_text(chat_id, first, None, thread_kwargs)
+
+        for chunk in rest:
+            await self._send_text(chat_id, chunk, None, thread_kwargs)
+
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive message editing: send on first delta, edit on subsequent ones."""
         if not self._app:
             return
         meta = metadata or {}
         int_chat_id = int(chat_id)
+        thread_kwargs = {}
+        message_thread_id = meta.get("message_thread_id")
+        if message_thread_id is not None:
+            thread_kwargs["message_thread_id"] = message_thread_id
 
         if meta.get("_stream_end"):
             buf = self._stream_bufs.get(chat_id)
-            if not buf or not buf.message_id or not buf.text:
+            if not buf or not buf.text:
+                self._stream_bufs.pop(chat_id, None)
                 return
             self._stop_typing(chat_id)
             try:
-                html = _markdown_to_telegram_html(buf.text)
-                await self._call_with_retry(
-                    self._app.bot.edit_message_text,
-                    chat_id=int_chat_id, message_id=buf.message_id,
-                    text=html, parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
-                try:
+                if len(buf.text) > TELEGRAM_STREAM_EDIT_SAFE_LEN:
+                    await self._flush_stream_chunks(int_chat_id, buf, thread_kwargs)
+                elif buf.message_id is not None:
+                    html = _markdown_to_telegram_html(buf.text)
                     await self._call_with_retry(
                         self._app.bot.edit_message_text,
-                        chat_id=int_chat_id, message_id=buf.message_id,
-                        text=buf.text,
+                        chat_id=int_chat_id,
+                        message_id=buf.message_id,
+                        text=html,
+                        parse_mode="HTML",
+                        **thread_kwargs,
                     )
-                except Exception as e2:
-                    logger.warning("Final stream edit failed: {}", e2)
-                    raise  # Let ChannelManager handle retry
+                else:
+                    await self._send_text(int_chat_id, buf.text, None, thread_kwargs)
+            except Exception as e:
+                if _is_message_too_long_error(e):
+                    logger.info("Final stream message too long; flushing as chunks")
+                    await self._flush_stream_chunks(int_chat_id, buf, thread_kwargs)
+                else:
+                    logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
+                    try:
+                        if buf.message_id is not None:
+                            await self._call_with_retry(
+                                self._app.bot.edit_message_text,
+                                chat_id=int_chat_id,
+                                message_id=buf.message_id,
+                                text=buf.text,
+                                **thread_kwargs,
+                            )
+                        else:
+                            await self._send_text(int_chat_id, buf.text, None, thread_kwargs)
+                    except Exception as e2:
+                        if _is_message_too_long_error(e2):
+                            logger.info("Final stream plain message too long; flushing as chunks")
+                            await self._flush_stream_chunks(int_chat_id, buf, thread_kwargs)
+                        else:
+                            logger.warning("Final stream edit failed: {}", e2)
+                            raise  # Let ChannelManager handle retry
             self._stream_bufs.pop(chat_id, None)
             return
 
@@ -522,10 +603,15 @@ class TelegramChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.message_id is None:
+            initial = buf.text
+            if len(initial) > TELEGRAM_STREAM_EDIT_SAFE_LEN:
+                initial = initial[:TELEGRAM_STREAM_EDIT_SAFE_LEN]
             try:
                 sent = await self._call_with_retry(
                     self._app.bot.send_message,
-                    chat_id=int_chat_id, text=buf.text,
+                    chat_id=int_chat_id,
+                    text=initial,
+                    **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
                 buf.last_edit = now
@@ -536,11 +622,17 @@ class TelegramChannel(BaseChannel):
             try:
                 await self._call_with_retry(
                     self._app.bot.edit_message_text,
-                    chat_id=int_chat_id, message_id=buf.message_id,
+                    chat_id=int_chat_id,
+                    message_id=buf.message_id,
                     text=buf.text,
+                    **thread_kwargs,
                 )
                 buf.last_edit = now
             except Exception as e:
+                if _is_message_too_long_error(e):
+                    logger.info("Stream edit exceeded Telegram length limit; deferring chunk flush to stream end")
+                    buf.last_edit = now
+                    return
                 logger.warning("Stream edit failed: {}", e)
                 raise  # Let ChannelManager handle retry
 
