@@ -2,6 +2,7 @@
 
 from nanobot.knowledge.wa_group_kb import (
     WAGroupKnowledgeConfig,
+    WAGroupKnowledgeDeepMode,
     WAGroupKnowledgeGroup,
     archive_inbound_message,
     build_runtime_context_lines,
@@ -14,6 +15,7 @@ from nanobot.knowledge.wa_group_kb import (
 
 __all__ = [
     "WAGroupKnowledgeConfig",
+    "WAGroupKnowledgeDeepMode",
     "WAGroupKnowledgeGroup",
     "archive_inbound_message",
     "build_runtime_context_lines",

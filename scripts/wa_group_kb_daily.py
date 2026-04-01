@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import re
+import html
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -53,6 +54,7 @@ class DailyBuild:
     topics: list[dict[str, str]]
     entities: list[dict[str, str]]
     message_count: int
+    deep_rows: list[dict[str, str]]
 
 
 def _tokenize(text: str) -> list[str]:
@@ -69,6 +71,87 @@ def _day_from_args(day: str | None, tz_name: str) -> date:
     if day:
         return date.fromisoformat(day)
     return (datetime.now(tz).date() - timedelta(days=1))
+
+
+def _strip_html_to_text(raw_html: str) -> str:
+    cleaned = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw_html)
+    cleaned = re.sub(r"(?is)<style.*?>.*?</style>", " ", cleaned)
+    cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _extract_meta_content(raw_html: str, name: str) -> str:
+    patterns = [
+        rf'(?is)<meta[^>]+name=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'(?is)<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'(?is)<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']{re.escape(name)}["\']',
+        rf'(?is)<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{re.escape(name)}["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw_html)
+        if m:
+            return html.unescape((m.group(1) or "").strip())
+    return ""
+
+
+def _fetch_link_deep(url: str, timeout_seconds: int = 8, max_chars: int = 12000) -> dict[str, str]:
+    row: dict[str, str] = {
+        "url": url,
+        "status": "",
+        "domain": "",
+        "title": "",
+        "description": "",
+        "snippet": "",
+        "error": "",
+    }
+
+    try:
+        host = (urlparse(url).netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        row["domain"] = host
+    except Exception:
+        pass
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "nanobot-wa-kb/1.0 (+https://github.com/HKUDS/nanobot)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:  # nosec B310
+            status = getattr(resp, "status", 200)
+            row["status"] = str(status)
+            ctype = str(resp.headers.get("Content-Type", ""))
+            raw = resp.read(max_chars + 1)
+            raw = raw[:max_chars]
+            text = raw.decode("utf-8", errors="ignore")
+
+        if "html" not in ctype.lower():
+            row["snippet"] = f"Non-HTML content type: {ctype}"[:280]
+            return row
+
+        title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+        if title_match:
+            row["title"] = re.sub(r"\s+", " ", html.unescape(title_match.group(1))).strip()[:180]
+
+        desc = _extract_meta_content(text, "description") or _extract_meta_content(text, "og:description")
+        if desc:
+            row["description"] = re.sub(r"\s+", " ", desc).strip()[:220]
+
+        plain = _strip_html_to_text(text)
+        if plain:
+            row["snippet"] = plain[:320]
+
+        return row
+    except Exception as exc:
+        row["error"] = str(exc)[:200]
+        return row
 
 
 @contextmanager
@@ -95,7 +178,17 @@ def _file_lock(lock_path: Path):
             fd.close()
 
 
-def _build(events: list[dict[str, Any]], day: date, group_id: str, chat_jid: str = "") -> DailyBuild:
+def _build(
+    events: list[dict[str, Any]],
+    day: date,
+    group_id: str,
+    chat_jid: str = "",
+    *,
+    deep_enabled: bool = False,
+    deep_max_links: int = 8,
+    deep_timeout_seconds: int = 8,
+    deep_max_chars_per_page: int = 12000,
+) -> DailyBuild:
     message_count = len(events)
     all_text = []
     links_seen: dict[str, dict[str, str]] = {}
@@ -103,6 +196,7 @@ def _build(events: list[dict[str, Any]], day: date, group_id: str, chat_jid: str
     entity_counter: Counter[str] = Counter()
     tasks: list[dict[str, str]] = []
     decisions: list[dict[str, str]] = []
+    deep_rows: list[dict[str, str]] = []
 
     for e in events:
         text = (e.get("text") or "").strip()
@@ -173,6 +267,29 @@ def _build(events: list[dict[str, Any]], day: date, group_id: str, chat_jid: str
     summary_lines += ["", "## Entities"]
     summary_lines.extend([f"- {e}" for e in top_entities] or ["- (none)"])
 
+    if deep_enabled and links_seen:
+        for url in sorted(links_seen.keys())[: max(deep_max_links, 1)]:
+            deep_rows.append(
+                _fetch_link_deep(
+                    url,
+                    timeout_seconds=deep_timeout_seconds,
+                    max_chars=deep_max_chars_per_page,
+                )
+            )
+
+    if deep_rows:
+        summary_lines += ["", "## Deep Link Context"]
+        for row in deep_rows:
+            title = row.get("title") or "(untitled)"
+            domain = row.get("domain") or "(unknown domain)"
+            status = row.get("status") or "n/a"
+            summary_lines.append(f"- {domain} [{status}] — {title}")
+            desc = (row.get("description") or row.get("snippet") or "").strip()
+            if desc:
+                summary_lines.append(f"  - {desc[:220]}")
+            if row.get("error"):
+                summary_lines.append(f"  - fetch_error: {row['error']}")
+
     facts_lines = [f"# Facts ({day.isoformat()})", ""]
     card_idx = 1
 
@@ -208,6 +325,21 @@ def _build(events: list[dict[str, Any]], day: date, group_id: str, chat_jid: str
         ]
         card_idx += 1
 
+    for row in deep_rows:
+        facts_lines += [
+            f"## CARD-{day.strftime('%Y%m%d')}-{card_idx:03d}",
+            "type: deep-link",
+            f"url: {row.get('url', '')}",
+            f"domain: {row.get('domain', '')}",
+            f"status: {row.get('status', '')}",
+            f"title: {row.get('title', '')}",
+            f"description: {row.get('description', '')}",
+            f"snippet: {(row.get('snippet', '') or '')[:220]}",
+            f"error: {row.get('error', '')}",
+            "",
+        ]
+        card_idx += 1
+
     links_rows = list(links_seen.values())
     topics_rows = [
         {"topic": topic, "count": str(cnt), "day": day.isoformat()}
@@ -225,6 +357,7 @@ def _build(events: list[dict[str, Any]], day: date, group_id: str, chat_jid: str
         topics=topics_rows,
         entities=entities_rows,
         message_count=message_count,
+        deep_rows=deep_rows,
     )
 
 
@@ -259,6 +392,50 @@ async def _send_whatsapp_message(bridge_url: str, bridge_token: str, chat_id: st
         )
 
 
+def _append_daily_deep_index(root: Path, day: date, rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+
+    index_dir = root / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    path = index_dir / "deep.md"
+    old = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else "# Deep Link Index\n"
+    marker = f"## {day.isoformat()}"
+
+    lines = old.splitlines()
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == marker:
+            i += 1
+            while i < len(lines) and not lines[i].startswith("## "):
+                i += 1
+            continue
+        kept.append(line)
+        i += 1
+
+    chunk = ["", marker]
+    for row in rows:
+        url = row.get("url", "")
+        domain = row.get("domain", "")
+        title = row.get("title", "")
+        status = row.get("status", "")
+        snippet = (row.get("description") or row.get("snippet") or "").strip()[:200]
+        err = row.get("error", "")
+        line = f"- url={url} | domain={domain} | status={status} | title={title}"
+        if snippet:
+            line += f" | summary={snippet}"
+        if err:
+            line += f" | error={err}"
+        chunk.append(line)
+
+    content = "\n".join(kept).rstrip() + "\n" + "\n".join(chunk) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _build_recap_text(*, group_id: str, day: date, built: DailyBuild, root: Path) -> str:
     top_topics = [row.get("topic", "") for row in built.topics[:5] if row.get("topic")]
     topics_line = ", ".join(top_topics) if top_topics else "(none)"
@@ -274,6 +451,19 @@ def _build_recap_text(*, group_id: str, day: date, built: DailyBuild, root: Path
         if host and host not in domains:
             domains.append(host)
 
+    deep_domains: list[str] = []
+    deep_titles: list[str] = []
+    deep_ok = 0
+    for row in built.deep_rows:
+        if row.get("status") and not row.get("error"):
+            deep_ok += 1
+        d = (row.get("domain") or "").strip()
+        if d and d not in deep_domains:
+            deep_domains.append(d)
+        t = (row.get("title") or "").strip()
+        if t:
+            deep_titles.append(t)
+
     if built.message_count <= 0:
         context_line = "No usable context captured for this day."
     else:
@@ -286,9 +476,15 @@ def _build_recap_text(*, group_id: str, day: date, built: DailyBuild, root: Path
         if domains:
             pieces.append(f"with references shared from {', '.join(domains[:3])}")
 
+        if built.deep_rows:
+            if deep_domains:
+                pieces.append(f"deep-check read {deep_ok}/{len(built.deep_rows)} links ({', '.join(deep_domains[:3])})")
+            else:
+                pieces.append(f"deep-check read {deep_ok}/{len(built.deep_rows)} links")
+
         context_line = "; ".join(pieces) + "."
 
-    return (
+    out = (
         f"🧠 WA KB daily summary\n"
         f"date: {day.isoformat()}\n"
         f"messages: {built.message_count}\n"
@@ -296,6 +492,11 @@ def _build_recap_text(*, group_id: str, day: date, built: DailyBuild, root: Path
         f"top_topics: {topics_line}\n"
         f"context: {context_line}"
     )
+
+    if deep_titles:
+        out += "\ncontent_hint: " + " | ".join(deep_titles[:2])
+
+    return out
 
 
 def _maybe_send_recap(*, workspace: Path, group_id: str, day: date, built: DailyBuild, root: Path, recap_chat_id_arg: str = "") -> None:
@@ -385,7 +586,23 @@ def main() -> int:
                 print(f"[wa-kb] no events for group={group_id}{scope} day={day.isoformat()}")
                 return 0
 
-            built = _build(events, day, group_id, args.chat_jid or "")
+            cfg = load_config()
+            channels_cfg = cfg.channels
+            whatsapp_cfg = channels_cfg.get("whatsapp") if isinstance(channels_cfg, dict) else getattr(channels_cfg, "whatsapp", None)
+            kb_cfg = parse_whatsapp_knowledge_config(whatsapp_cfg)
+            group_cfg = (kb_cfg.groups or {}).get(group_id) if kb_cfg.enabled else None
+            deep_cfg = group_cfg.deep_mode if group_cfg else None
+
+            built = _build(
+                events,
+                day,
+                group_id,
+                args.chat_jid or "",
+                deep_enabled=bool(deep_cfg.enabled) if deep_cfg else False,
+                deep_max_links=int(deep_cfg.max_links_per_day) if deep_cfg else 8,
+                deep_timeout_seconds=int(deep_cfg.timeout_seconds) if deep_cfg else 8,
+                deep_max_chars_per_page=int(deep_cfg.max_chars_per_page) if deep_cfg else 12000,
+            )
             write_daily_outputs(
                 root=root,
                 day=day,
@@ -395,6 +612,7 @@ def main() -> int:
                 topics=built.topics,
                 entities=built.entities,
             )
+            _append_daily_deep_index(root, day, built.deep_rows)
             print(
                 f"[wa-kb] processed group={group_id} day={day.isoformat()} "
                 f"events={len(events)} links={len(built.links)}"

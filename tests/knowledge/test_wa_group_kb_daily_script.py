@@ -162,8 +162,97 @@ def test_daily_script_sends_recap_when_enabled(tmp_path: Path, monkeypatch) -> N
     token, chat_id, text = sent[0]
     assert token == "123:ABC"
     assert chat_id == "1224491205"
-    assert "WA KB nightly recap" in text
-    assert "group_id: 120363038334877727" in text
+    assert "WA KB daily summary" in text
+    assert "context:" in text
+
+
+def test_daily_script_deep_mode_writes_deep_index(tmp_path: Path, monkeypatch) -> None:
+    module = _load_module()
+    main = module.main
+    workspace = tmp_path
+    gid = "120363038334877727"
+
+    raw_dir = workspace / "knowledge" / "whatsapp" / gid / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_file = raw_dir / "2026-03-30.jsonl"
+    raw_file.write_text(
+        json.dumps(
+            {
+                "ts": "2026-03-30T01:00:00",
+                "chat_jid": f"{gid}@g.us",
+                "group_id": gid,
+                "message_id": "m1",
+                "sender_jid": "62811@s.whatsapp.net",
+                "sender_name": "alice",
+                "text": "useful link https://example.com/vision",
+                "urls": ["https://example.com/vision"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = _FakeConfig(
+        {
+            "whatsapp": {
+                "knowledge": {
+                    "enabled": True,
+                    "groups": {
+                        gid: {
+                            "enabled": True,
+                            "deepMode": {
+                                "enabled": True,
+                                "maxLinksPerDay": 3,
+                                "timeoutSeconds": 5,
+                                "maxCharsPerPage": 4000,
+                            },
+                            "recapEnabled": False,
+                        }
+                    },
+                },
+                "bridgeUrl": "ws://localhost:3001",
+                "bridgeToken": "",
+            },
+            "telegram": {"token": "123:ABC"},
+        }
+    )
+    monkeypatch.setattr(module, "load_config", lambda: cfg)
+
+    def _fake_fetch(url: str, timeout_seconds: int = 8, max_chars: int = 12000):
+        return {
+            "url": url,
+            "status": "200",
+            "domain": "example.com",
+            "title": "Example Vision",
+            "description": "Vision project page",
+            "snippet": "Example vision snippet",
+            "error": "",
+        }
+
+    monkeypatch.setattr(module, "_fetch_link_deep", _fake_fetch)
+
+    argv = [
+        "wa_group_kb_daily.py",
+        "--workspace",
+        str(workspace),
+        "--group-id",
+        gid,
+        "--date",
+        "2026-03-30",
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    rc = main()
+    assert rc == 0
+
+    root = workspace / "knowledge" / "whatsapp" / gid
+    deep_idx = (root / "index" / "deep.md").read_text(encoding="utf-8")
+    assert "## 2026-03-30" in deep_idx
+    assert "title=Example Vision" in deep_idx
+
+    summary = (root / "daily" / "2026-03-30.md").read_text(encoding="utf-8")
+    assert "## Deep Link Context" in summary
+
 
 
 def test_daily_script_skips_recap_when_not_enabled(tmp_path: Path, monkeypatch) -> None:

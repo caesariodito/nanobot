@@ -176,6 +176,33 @@ def test_parse_group_config_recap_fields() -> None:
     assert grp.recap_chat_id == "1224491205"
 
 
+def test_parse_group_config_deep_mode_fields() -> None:
+    parsed = parse_whatsapp_knowledge_config(
+        {
+            "knowledge": {
+                "enabled": True,
+                "groups": {
+                    "120363038334877727": {
+                        "enabled": True,
+                        "deepMode": {
+                            "enabled": True,
+                            "maxLinksPerDay": 12,
+                            "timeoutSeconds": 9,
+                            "maxCharsPerPage": 24000,
+                        },
+                    }
+                },
+            }
+        }
+    )
+
+    grp = parsed.groups["120363038334877727"]
+    assert grp.deep_mode.enabled is True
+    assert grp.deep_mode.max_links_per_day == 12
+    assert grp.deep_mode.timeout_seconds == 9
+    assert grp.deep_mode.max_chars_per_page == 24000
+
+
 def test_write_daily_outputs_is_idempotent_for_same_day_index(tmp_path: Path) -> None:
     gid = "120363038334877727"
     root = group_root(tmp_path, gid)

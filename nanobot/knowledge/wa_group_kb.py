@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,16 @@ from nanobot.utils.helpers import ensure_dir
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _DATE_IN_PATH_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
+
+
+@dataclass(slots=True)
+class WAGroupKnowledgeDeepMode:
+    """Optional deep link-analysis settings for nightly processing."""
+
+    enabled: bool = False
+    max_links_per_day: int = 8
+    timeout_seconds: int = 8
+    max_chars_per_page: int = 12000
 
 
 @dataclass(slots=True)
@@ -30,6 +40,7 @@ class WAGroupKnowledgeGroup:
     recap_enabled: bool = False
     recap_channel: str = "telegram"
     recap_chat_id: str | None = None
+    deep_mode: WAGroupKnowledgeDeepMode = field(default_factory=WAGroupKnowledgeDeepMode)
 
 
 @dataclass(slots=True)
@@ -79,6 +90,26 @@ def _parse_group_config(group_id: str, raw: Any) -> WAGroupKnowledgeGroup | None
     except (TypeError, ValueError):
         max_daily_messages_int = 5000
 
+    deep_raw = raw.get("deepMode", raw.get("deep_mode", {}))
+    if deep_raw is True:
+        deep_raw = {"enabled": True}
+    elif deep_raw is False or not isinstance(deep_raw, dict):
+        deep_raw = {}
+
+    def _safe_int(v: Any, default: int, min_value: int, max_value: int) -> int:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        return max(min(n, max_value), min_value)
+
+    deep_mode = WAGroupKnowledgeDeepMode(
+        enabled=bool(deep_raw.get("enabled", False)),
+        max_links_per_day=_safe_int(deep_raw.get("maxLinksPerDay", deep_raw.get("max_links_per_day", 8)), 8, 1, 50),
+        timeout_seconds=_safe_int(deep_raw.get("timeoutSeconds", deep_raw.get("timeout_seconds", 8)), 8, 2, 30),
+        max_chars_per_page=_safe_int(deep_raw.get("maxCharsPerPage", deep_raw.get("max_chars_per_page", 12000)), 12000, 1000, 100000),
+    )
+
     return WAGroupKnowledgeGroup(
         group_id=str(group_id),
         enabled=bool(raw.get("enabled", True)),
@@ -92,6 +123,7 @@ def _parse_group_config(group_id: str, raw: Any) -> WAGroupKnowledgeGroup | None
         recap_chat_id=(
             str(raw.get("recapChatId") or raw.get("recap_chat_id") or "").strip() or None
         ),
+        deep_mode=deep_mode,
     )
 
 

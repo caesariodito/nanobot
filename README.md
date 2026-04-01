@@ -497,9 +497,15 @@ nanobot channels login whatsapp
             "maxDailyMessages": 5000,
             "timezone": "Asia/Jakarta",
             "dailyRunAt": "00:05",
+            "deepMode": {
+              "enabled": true,
+              "maxLinksPerDay": 8,
+              "timeoutSeconds": 8,
+              "maxCharsPerPage": 12000
+            },
             "recapEnabled": true,
-            "recapChannel": "telegram",
-            "recapChatId": "1224491205"
+            "recapChannel": "whatsapp",
+            "recapChatId": "120363038334877727@g.us"
           }
         }
       }
@@ -522,7 +528,9 @@ nanobot gateway
 > `groupPolicyMap`: per-group override map; key can be numeric group id (e.g. `120363...`) or full JID (`120363...@g.us`).
 > `autoReadGroups`: list of groups where inbound messages are marked as read automatically.
 > `knowledge.enabled`: enable WhatsApp group knowledge archive + retrieval injection.
-> `knowledge.groups.<groupId>`: per-group KB settings (retrievalTopK, maxDailyMessages, timezone, dailyRunAt, recapEnabled, recapChannel, recapChatId).
+> `knowledge.groups.<groupId>`: per-group KB settings (retrievalTopK, maxDailyMessages, timezone, dailyRunAt, deepMode, recapEnabled, recapChannel, recapChatId).
+> `deepMode`: optional nightly URL fetch + lightweight content extraction (`enabled`, `maxLinksPerDay`, `timeoutSeconds`, `maxCharsPerPage`).
+> `recapChannel`: `telegram` or `whatsapp`.
 >
 > Nightly processor example (Linux crontab, WIB):
 > ```bash
