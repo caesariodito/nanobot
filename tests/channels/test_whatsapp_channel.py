@@ -1,25 +1,38 @@
 """Tests for WhatsApp channel outbound media support."""
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.channels.whatsapp import WhatsAppChannel
+from nanobot.knowledge.wa_group_kb import group_root
 
 
-def _make_channel() -> WhatsAppChannel:
+def _make_channel(tmp_path: Path | None = None, monkeypatch=None, config: dict | None = None) -> WhatsAppChannel:
     bus = MagicMock()
-    ch = WhatsAppChannel({"enabled": True}, bus)
+
+    if tmp_path is not None and monkeypatch is not None:
+        class _Loaded:
+            workspace_path = tmp_path
+
+        monkeypatch.setattr("nanobot.config.loader.load_config", lambda *args, **kwargs: _Loaded())
+
+    base_cfg = {"enabled": True}
+    if config:
+        base_cfg.update(config)
+
+    ch = WhatsAppChannel(base_cfg, bus)
     ch._ws = AsyncMock()
     ch._connected = True
     return ch
 
 
 @pytest.mark.asyncio
-async def test_send_text_only():
-    ch = _make_channel()
+async def test_send_text_only(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch)
     msg = OutboundMessage(channel="whatsapp", chat_id="123@s.whatsapp.net", content="hello")
 
     await ch.send(msg)
@@ -31,8 +44,8 @@ async def test_send_text_only():
 
 
 @pytest.mark.asyncio
-async def test_send_media_dispatches_send_media_command():
-    ch = _make_channel()
+async def test_send_media_dispatches_send_media_command(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch)
     msg = OutboundMessage(
         channel="whatsapp",
         chat_id="123@s.whatsapp.net",
@@ -56,8 +69,8 @@ async def test_send_media_dispatches_send_media_command():
 
 
 @pytest.mark.asyncio
-async def test_send_media_only_no_text():
-    ch = _make_channel()
+async def test_send_media_only_no_text(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch)
     msg = OutboundMessage(
         channel="whatsapp",
         chat_id="123@s.whatsapp.net",
@@ -74,8 +87,8 @@ async def test_send_media_only_no_text():
 
 
 @pytest.mark.asyncio
-async def test_send_multiple_media():
-    ch = _make_channel()
+async def test_send_multiple_media(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch)
     msg = OutboundMessage(
         channel="whatsapp",
         chat_id="123@s.whatsapp.net",
@@ -93,8 +106,8 @@ async def test_send_multiple_media():
 
 
 @pytest.mark.asyncio
-async def test_send_when_disconnected_is_noop():
-    ch = _make_channel()
+async def test_send_when_disconnected_is_noop(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch)
     ch._connected = False
 
     msg = OutboundMessage(
@@ -109,8 +122,8 @@ async def test_send_when_disconnected_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_group_policy_mention_skips_unmentioned_group_message():
-    ch = WhatsAppChannel({"enabled": True, "groupPolicy": "mention"}, MagicMock())
+async def test_group_policy_mention_skips_unmentioned_group_message(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch, {"groupPolicy": "mention"})
     ch._handle_message = AsyncMock()
 
     await ch._handle_bridge_message(
@@ -132,8 +145,8 @@ async def test_group_policy_mention_skips_unmentioned_group_message():
 
 
 @pytest.mark.asyncio
-async def test_group_policy_mention_accepts_mentioned_group_message():
-    ch = WhatsAppChannel({"enabled": True, "groupPolicy": "mention"}, MagicMock())
+async def test_group_policy_mention_accepts_mentioned_group_message(tmp_path: Path, monkeypatch):
+    ch = _make_channel(tmp_path, monkeypatch, {"groupPolicy": "mention"})
     ch._handle_message = AsyncMock()
 
     await ch._handle_bridge_message(
@@ -155,3 +168,81 @@ async def test_group_policy_mention_accepts_mentioned_group_message():
     kwargs = ch._handle_message.await_args.kwargs
     assert kwargs["chat_id"] == "12345@g.us"
     assert kwargs["sender_id"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_kb_archives_configured_group_messages(tmp_path: Path, monkeypatch):
+    group_id = "120363038334877727"
+    ch = _make_channel(
+        tmp_path,
+        monkeypatch,
+        {
+            "knowledge": {
+                "enabled": True,
+                "groups": {
+                    group_id: {
+                        "enabled": True,
+                        "maxDailyMessages": 100,
+                    }
+                },
+            }
+        },
+    )
+    ch._handle_message = AsyncMock()
+
+    await ch._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "m-kb-1",
+                "sender": f"{group_id}@g.us",
+                "pn": "62811@s.whatsapp.net",
+                "content": "latest AI Vision Model link https://example.com/vision",
+                "timestamp": 1711886400,
+                "isGroup": True,
+                "wasMentioned": False,
+            }
+        )
+    )
+
+    raw_dir = group_root(tmp_path, group_id) / "raw"
+    files = sorted(raw_dir.glob("*.jsonl"))
+    assert files, "expected JSONL archive to be created"
+    body = files[-1].read_text(encoding="utf-8")
+    assert "m-kb-1" in body
+    assert "https://example.com/vision" in body
+
+
+@pytest.mark.asyncio
+async def test_kb_does_not_archive_unlisted_group(tmp_path: Path, monkeypatch):
+    ch = _make_channel(
+        tmp_path,
+        monkeypatch,
+        {
+            "knowledge": {
+                "enabled": True,
+                "groups": {
+                    "120363038334877727": {"enabled": True},
+                },
+            }
+        },
+    )
+    ch._handle_message = AsyncMock()
+
+    await ch._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "m-kb-2",
+                "sender": "99999@g.us",
+                "pn": "62811@s.whatsapp.net",
+                "content": "hello world",
+                "timestamp": 1711886400,
+                "isGroup": True,
+                "wasMentioned": False,
+            }
+        )
+    )
+
+    raw_dir = group_root(tmp_path, "99999") / "raw"
+    assert not raw_dir.exists()

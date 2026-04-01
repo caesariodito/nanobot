@@ -53,6 +53,8 @@ class ChannelManager:
                 continue
             try:
                 channel = cls(section, self.bus)
+                if hasattr(channel, "set_workspace"):
+                    channel.set_workspace(self.config.workspace_path)
                 channel.transcription_api_key = groq_key
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)

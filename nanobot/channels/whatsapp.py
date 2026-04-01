@@ -10,6 +10,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
+from nanobot.knowledge.wa_group_kb import (
+    archive_inbound_message,
+    normalize_group_id,
+    parse_whatsapp_knowledge_config,
+)
+
 from loguru import logger
 from pydantic import Field
 
@@ -29,6 +35,7 @@ class WhatsAppConfig(Base):
     group_policy: Literal["open", "mention"] = "open"  # "open" responds to all, "mention" only when @mentioned
     group_policy_map: dict[str, Literal["open", "mention"]] = Field(default_factory=dict)
     auto_read_groups: list[str] = Field(default_factory=list)
+    knowledge: dict[str, Any] = Field(default_factory=dict)
 
 
 class WhatsAppChannel(BaseChannel):
@@ -53,6 +60,18 @@ class WhatsAppChannel(BaseChannel):
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
+
+        from nanobot.config.loader import load_config
+
+        loaded = load_config()
+        self._workspace = loaded.workspace_path
+        parsed_kb = parse_whatsapp_knowledge_config(self.config)
+        self._kb_enabled = parsed_kb.enabled
+        self._kb_groups = parsed_kb.groups or {}
+
+    def set_workspace(self, workspace: Path) -> None:
+        """Set runtime workspace path from gateway context."""
+        self._workspace = workspace
 
     async def login(self, force: bool = False) -> bool:
         """
@@ -195,13 +214,32 @@ class WhatsAppChannel(BaseChannel):
             is_group = data.get("isGroup", False)
             was_mentioned = data.get("wasMentioned", False)
 
-            def _normalize_group_id(chat_jid: str) -> str:
-                base = chat_jid.split("@", 1)[0] if "@" in chat_jid else chat_jid
-                return base.split(":", 1)[0] if ":" in base else base
+            user_id = pn if pn else sender
+            sender_id = user_id.split("@")[0] if "@" in user_id else user_id
+            logger.info("Sender {}", sender)
+
+            # Handle voice transcription if it's a voice message
+            if content == "[Voice Message]":
+                logger.info(
+                    "Voice message received from {}, but direct download from bridge is not yet supported.",
+                    sender_id,
+                )
+                content = "[Voice Message: Transcription not available for WhatsApp yet]"
+
+            # Extract media paths (images/documents/videos downloaded by the bridge)
+            media_paths = data.get("media") or []
+
+            # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
+            if media_paths:
+                for p in media_paths:
+                    mime, _ = mimetypes.guess_type(p)
+                    media_type = "image" if mime and mime.startswith("image/") else "file"
+                    media_tag = f"[{media_type}: {p}]"
+                    content = f"{content}\n{media_tag}" if content else media_tag
 
             group_policy = getattr(self.config, "group_policy", "open")
             if is_group:
-                group_id = _normalize_group_id(sender)
+                group_id = normalize_group_id(sender)
                 group_policy_map = getattr(self.config, "group_policy_map", {}) or {}
                 effective_policy = group_policy_map.get(sender, group_policy_map.get(group_id, group_policy))
 
@@ -236,31 +274,33 @@ class WhatsAppChannel(BaseChannel):
                             e,
                         )
 
+                if self._kb_enabled:
+                    group_cfg = self._kb_groups.get(group_id)
+                    if group_cfg and group_cfg.enabled:
+                        try:
+                            archive_inbound_message(
+                                workspace=self._workspace,
+                                group_id=group_id,
+                                chat_jid=sender,
+                                message_id=message_id,
+                                sender_jid=pn if pn else sender,
+                                sender_name=(pn if pn else sender).split("@", 1)[0],
+                                content=content,
+                                participant=data.get("participant") or "",
+                                timestamp=data.get("timestamp"),
+                                media=media_paths,
+                                metadata={
+                                    "is_group": bool(is_group),
+                                    "was_mentioned": bool(was_mentioned),
+                                },
+                                max_daily_messages=group_cfg.max_daily_messages,
+                                timezone_name=group_cfg.timezone,
+                            )
+                        except Exception as e:
+                            logger.warning("WA KB archive failed for group {} message {}: {}", group_id, message_id, e)
+
                 if dropped_by_policy:
                     return
-
-            user_id = pn if pn else sender
-            sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            logger.info("Sender {}", sender)
-
-            # Handle voice transcription if it's a voice message
-            if content == "[Voice Message]":
-                logger.info(
-                    "Voice message received from {}, but direct download from bridge is not yet supported.",
-                    sender_id,
-                )
-                content = "[Voice Message: Transcription not available for WhatsApp yet]"
-
-            # Extract media paths (images/documents/videos downloaded by the bridge)
-            media_paths = data.get("media") or []
-
-            # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
-            if media_paths:
-                for p in media_paths:
-                    mime, _ = mimetypes.guess_type(p)
-                    media_type = "image" if mime and mime.startswith("image/") else "file"
-                    media_tag = f"[{media_type}: {p}]"
-                    content = f"{content}\n{media_tag}" if content else media_tag
 
             await self._handle_message(
                 sender_id=sender_id,

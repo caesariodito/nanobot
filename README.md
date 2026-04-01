@@ -487,7 +487,22 @@ nanobot channels login whatsapp
       "groupPolicyMap": {
         "120363425946407740": "open"
       },
-      "autoReadGroups": ["120363425946407740"]
+      "autoReadGroups": ["120363425946407740"],
+      "knowledge": {
+        "enabled": true,
+        "groups": {
+          "120363038334877727": {
+            "enabled": true,
+            "retrievalTopK": 6,
+            "maxDailyMessages": 5000,
+            "timezone": "Asia/Jakarta",
+            "dailyRunAt": "00:05",
+            "recapEnabled": true,
+            "recapChannel": "telegram",
+            "recapChatId": "1224491205"
+          }
+        }
+      }
     }
   }
 }
@@ -506,6 +521,16 @@ nanobot gateway
 > `groupPolicy`: default group behavior (`"mention"` or `"open"`).
 > `groupPolicyMap`: per-group override map; key can be numeric group id (e.g. `120363...`) or full JID (`120363...@g.us`).
 > `autoReadGroups`: list of groups where inbound messages are marked as read automatically.
+> `knowledge.enabled`: enable WhatsApp group knowledge archive + retrieval injection.
+> `knowledge.groups.<groupId>`: per-group KB settings (retrievalTopK, maxDailyMessages, timezone, dailyRunAt, recapEnabled, recapChannel, recapChatId).
+>
+> Nightly processor example (Linux crontab, WIB):
+> ```bash
+> 5 0 * * * cd /root/src/nanobot && /usr/bin/python3 scripts/wa_group_kb_daily.py \
+>   --workspace ~/.nanobot/workspace \
+>   --group-id 120363038334877727 \
+>   --tz Asia/Jakarta
+> ```
 >
 > WhatsApp bridge updates are not applied automatically for existing installations.
 > After upgrading nanobot, rebuild the local bridge with:

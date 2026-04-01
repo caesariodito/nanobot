@@ -27,6 +27,11 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.knowledge.wa_group_kb import (
+    build_runtime_context_lines,
+    get_whatsapp_kb_groups,
+    normalize_group_id,
+)
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
@@ -124,6 +129,7 @@ class AgentLoop:
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        self._wa_kb_groups = get_whatsapp_kb_groups(channels_config)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -195,6 +201,56 @@ class AgentLoop:
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    def _build_whatsapp_kb_context(self, msg: InboundMessage) -> str | None:
+        """Build runtime retrieval context for configured WhatsApp knowledge groups."""
+        if msg.channel != "whatsapp":
+            return None
+
+        group_id = normalize_group_id(msg.chat_id)
+        cfg = self._wa_kb_groups.get(group_id)
+        if not cfg:
+            return None
+
+        lines = build_runtime_context_lines(
+            workspace=self.workspace,
+            group_id=group_id,
+            query=msg.content,
+            top_k=cfg.retrieval_top_k,
+        )
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    @staticmethod
+    def _inject_runtime_context(initial_messages: list[dict], kb_context: str) -> None:
+        """Inject extra runtime context into the current user payload without polluting history."""
+        if not initial_messages:
+            return
+
+        current = initial_messages[-1]
+        content = current.get("content")
+
+        if isinstance(content, str):
+            # Expected layout from ContextBuilder:
+            # [Runtime Context tag + metadata]\n\n<user text>
+            if content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                head, sep, tail = content.partition("\n\n")
+                if sep:
+                    current["content"] = f"{head}\n{kb_context}\n\n{tail}"
+                else:
+                    current["content"] = f"{content}\n{kb_context}"
+            else:
+                current["content"] = f"{kb_context}\n\n{content}"
+            return
+
+        if isinstance(content, list):
+            if content and isinstance(content[0], dict) and content[0].get("type") == "text":
+                text = content[0].get("text")
+                if isinstance(text, str) and text.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                    content[0] = {**content[0], "text": f"{text}\n{kb_context}"}
+                    return
+            content.insert(0, {"type": "text", "text": kb_context})
 
     async def _run_agent_loop(
         self,
@@ -489,6 +545,10 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+
+        kb_context = self._build_whatsapp_kb_context(msg)
+        if kb_context:
+            self._inject_runtime_context(initial_messages, kb_context)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
