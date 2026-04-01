@@ -501,7 +501,10 @@ nanobot channels login whatsapp
               "enabled": true,
               "maxLinksPerDay": 8,
               "timeoutSeconds": 8,
-              "maxCharsPerPage": 12000
+              "maxCharsPerPage": 12000,
+              "fetchMode": "auto",
+              "browserDomains": ["instagram.com", "linkedin.com"],
+              "waitAfterLoadMs": 1200
             },
             "recapEnabled": true,
             "recapChannel": "whatsapp",
@@ -529,7 +532,12 @@ nanobot gateway
 > `autoReadGroups`: list of groups where inbound messages are marked as read automatically.
 > `knowledge.enabled`: enable WhatsApp group knowledge archive + retrieval injection.
 > `knowledge.groups.<groupId>`: per-group KB settings (retrievalTopK, maxDailyMessages, timezone, dailyRunAt, deepMode, recapEnabled, recapChannel, recapChatId).
-> `deepMode`: optional nightly URL fetch + lightweight content extraction (`enabled`, `maxLinksPerDay`, `timeoutSeconds`, `maxCharsPerPage`).
+> `deepMode`: optional nightly URL fetch + lightweight content extraction.
+> - `fetchMode`: `http`, `browser`, or `auto` (default, HTTP first then browser fallback on low-quality pages).
+> - `browserDomains`: always use browser fallback for selected domains/subdomains.
+> - `waitAfterLoadMs`: wait time after DOM load for JS hydration before extracting text.
+> - Other limits: `maxLinksPerDay`, `timeoutSeconds`, `maxCharsPerPage`.
+> - Deep fetch has SSRF guards (non-http(s), localhost/private/link-local targets, and direct-IP hosts are blocked).
 > `recapChannel`: `telegram` or `whatsapp`.
 >
 > Nightly processor example (Linux crontab, WIB):
@@ -538,6 +546,14 @@ nanobot gateway
 >   --workspace ~/.nanobot/workspace \
 >   --group-id 120363038334877727 \
 >   --tz Asia/Jakarta
+> ```
+>
+> If you enable browser fetch mode, install Playwright + Chromium in the same Python environment:
+> ```bash
+> pip install playwright
+> playwright install chromium
+> # if required by your distro:
+> playwright install-deps chromium
 > ```
 >
 > WhatsApp bridge updates are not applied automatically for existing installations.

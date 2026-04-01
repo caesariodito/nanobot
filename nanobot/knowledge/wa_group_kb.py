@@ -24,6 +24,9 @@ class WAGroupKnowledgeDeepMode:
     max_links_per_day: int = 8
     timeout_seconds: int = 8
     max_chars_per_page: int = 12000
+    fetch_mode: str = "auto"
+    browser_domains: list[str] = field(default_factory=list)
+    wait_after_load_ms: int = 1200
 
 
 @dataclass(slots=True)
@@ -103,11 +106,27 @@ def _parse_group_config(group_id: str, raw: Any) -> WAGroupKnowledgeGroup | None
             return default
         return max(min(n, max_value), min_value)
 
+    fetch_mode_raw = str(deep_raw.get("fetchMode", deep_raw.get("fetch_mode", "auto")) or "auto").strip().lower()
+    fetch_mode = fetch_mode_raw if fetch_mode_raw in {"http", "browser", "auto"} else "auto"
+
+    browser_domains_raw = deep_raw.get("browserDomains", deep_raw.get("browser_domains", []))
+    browser_domains: list[str] = []
+    if isinstance(browser_domains_raw, list):
+        for item in browser_domains_raw:
+            host = str(item or "").strip().lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                browser_domains.append(host)
+
     deep_mode = WAGroupKnowledgeDeepMode(
         enabled=bool(deep_raw.get("enabled", False)),
         max_links_per_day=_safe_int(deep_raw.get("maxLinksPerDay", deep_raw.get("max_links_per_day", 8)), 8, 1, 50),
         timeout_seconds=_safe_int(deep_raw.get("timeoutSeconds", deep_raw.get("timeout_seconds", 8)), 8, 2, 30),
         max_chars_per_page=_safe_int(deep_raw.get("maxCharsPerPage", deep_raw.get("max_chars_per_page", 12000)), 12000, 1000, 100000),
+        fetch_mode=fetch_mode,
+        browser_domains=browser_domains,
+        wait_after_load_ms=_safe_int(deep_raw.get("waitAfterLoadMs", deep_raw.get("wait_after_load_ms", 1200)), 1200, 0, 10000),
     )
 
     return WAGroupKnowledgeGroup(

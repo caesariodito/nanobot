@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
+import ipaddress
 import json
 import re
-import html
+import socket
 import urllib.error
 import urllib.request
 from collections import Counter
-from urllib.parse import urlparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from nanobot.config.loader import load_config
@@ -96,7 +98,7 @@ def _extract_meta_content(raw_html: str, name: str) -> str:
     return ""
 
 
-def _fetch_link_deep(url: str, timeout_seconds: int = 8, max_chars: int = 12000) -> dict[str, str]:
+def _new_deep_row(url: str) -> dict[str, str]:
     row: dict[str, str] = {
         "url": url,
         "status": "",
@@ -106,14 +108,106 @@ def _fetch_link_deep(url: str, timeout_seconds: int = 8, max_chars: int = 12000)
         "snippet": "",
         "error": "",
     }
-
     try:
-        host = (urlparse(url).netloc or "").lower()
+        host = (urlparse(url).hostname or "").lower().strip()
         if host.startswith("www."):
             host = host[4:]
         row["domain"] = host
     except Exception:
         pass
+    return row
+
+
+def _normalize_host(host: str) -> str:
+    out = (host or "").strip().lower()
+    if out.startswith("www."):
+        out = out[4:]
+    return out
+
+
+def _host_matches(domain: str, candidates: list[str] | None) -> bool:
+    host = _normalize_host(domain)
+    for item in candidates or []:
+        candidate = _normalize_host(str(item or ""))
+        if not candidate:
+            continue
+        if host == candidate or host.endswith("." + candidate):
+            return True
+    return False
+
+
+def _resolve_host_ips(host: str) -> set[str]:
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    out: set[str] = set()
+    for info in infos:
+        addr = (info[4] or [""])[0]
+        if addr:
+            out.add(addr)
+    return out
+
+
+def _is_blocked_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+        return True
+    if ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+        return True
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        extra_v4 = [
+            ipaddress.ip_network("100.64.0.0/10"),
+            ipaddress.ip_network("198.18.0.0/15"),
+        ]
+        return any(ip_obj in net for net in extra_v4)
+    return False
+
+
+def _validate_fetch_url(url: str) -> tuple[dict[str, str], str]:
+    row = _new_deep_row(url)
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return row, "invalid URL"
+
+    scheme = (parsed.scheme or "").lower().strip()
+    if scheme not in {"http", "https"}:
+        return row, f"unsupported URL scheme: {scheme or '(empty)'}"
+
+    host = _normalize_host(parsed.hostname or "")
+    if not host:
+        return row, "missing URL host"
+    row["domain"] = host
+
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return row, f"blocked host: {host}"
+
+    try:
+        ipaddress.ip_address(host)
+        return row, "blocked direct IP host"
+    except ValueError:
+        pass
+
+    try:
+        addresses = _resolve_host_ips(parsed.hostname or host)
+    except OSError as exc:
+        return row, f"dns lookup failed: {exc}"
+
+    if not addresses:
+        return row, "dns lookup returned no addresses"
+
+    for addr in addresses:
+        ip_str = str(addr).split("%", 1)[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip_obj):
+            return row, f"blocked target address: {ip_str}"
+
+    return row, ""
+
+
+def _fetch_link_http(url: str, timeout_seconds: int = 8, max_chars: int = 12000) -> dict[str, str]:
+    row = _new_deep_row(url)
 
     req = urllib.request.Request(
         url,
@@ -154,6 +248,211 @@ def _fetch_link_deep(url: str, timeout_seconds: int = 8, max_chars: int = 12000)
         return row
 
 
+class _BrowserFetcher:
+    def __init__(self, *, timeout_seconds: int = 8, wait_after_load_ms: int = 1200):
+        self.timeout_ms = max(int(timeout_seconds * 1000), 1000)
+        self.wait_after_load_ms = max(int(wait_after_load_ms), 0)
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    def _ensure_started(self) -> None:
+        if self._page is not None:
+            return
+
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(headless=True)
+        self._context = self._browser.new_context()
+
+        def _route_handler(route):
+            resource_type = str(getattr(route.request, "resource_type", "") or "")
+            if resource_type in {"image", "media", "font"}:
+                route.abort()
+                return
+            route.continue_()
+
+        self._context.route("**/*", _route_handler)
+        self._page = self._context.new_page()
+
+    def fetch(self, url: str, *, max_chars: int = 12000) -> dict[str, str]:
+        row = _new_deep_row(url)
+        try:
+            self._ensure_started()
+        except Exception as exc:
+            row["error"] = f"browser init failed: {exc}"[:200]
+            return row
+
+        try:
+            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            if resp is not None:
+                row["status"] = str(getattr(resp, "status", "") or "")
+
+            if self.wait_after_load_ms > 0:
+                self._page.wait_for_timeout(self.wait_after_load_ms)
+
+            payload = self._page.evaluate(
+                """
+                () => {
+                  const pickMeta = (keys) => {
+                    for (const key of keys) {
+                      const byName = document.querySelector(`meta[name=\"${key}\"]`);
+                      if (byName?.content) return byName.content;
+                      const byProp = document.querySelector(`meta[property=\"${key}\"]`);
+                      if (byProp?.content) return byProp.content;
+                    }
+                    return "";
+                  };
+                  const root = document.querySelector("article") || document.querySelector("main") || document.body;
+                  const text = (root?.innerText || "").replace(/\\s+/g, " ").trim();
+                  return {
+                    title: (document.title || "").trim(),
+                    description: (pickMeta(["description", "og:description", "twitter:description"]) || "").trim(),
+                    snippet: text.slice(0, 5000),
+                  };
+                }
+                """
+            ) or {}
+
+            title = str(payload.get("title") or "").strip()
+            desc = str(payload.get("description") or "").strip()
+            snippet = str(payload.get("snippet") or "").strip()
+
+            if title:
+                row["title"] = re.sub(r"\s+", " ", title)[:180]
+            if desc:
+                row["description"] = re.sub(r"\s+", " ", desc)[:220]
+            if snippet:
+                row["snippet"] = re.sub(r"\s+", " ", snippet)[: min(max_chars, 320)]
+
+            return row
+        except Exception as exc:
+            row["error"] = str(exc)[:200]
+            return row
+
+    def close(self) -> None:
+        for obj_name in ("_page", "_context", "_browser"):
+            obj = getattr(self, obj_name, None)
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception:
+                pass
+            setattr(self, obj_name, None)
+
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+
+def _fetch_link_browser(
+    url: str,
+    timeout_seconds: int = 8,
+    max_chars: int = 12000,
+    *,
+    wait_after_load_ms: int = 1200,
+    browser_fetcher: _BrowserFetcher | None = None,
+) -> dict[str, str]:
+    if browser_fetcher is not None:
+        return browser_fetcher.fetch(url, max_chars=max_chars)
+
+    fetcher = _BrowserFetcher(timeout_seconds=timeout_seconds, wait_after_load_ms=wait_after_load_ms)
+    try:
+        return fetcher.fetch(url, max_chars=max_chars)
+    finally:
+        fetcher.close()
+
+
+def _is_low_quality_result(row: dict[str, str]) -> bool:
+    if row.get("error"):
+        return True
+
+    title = str(row.get("title") or "").strip()
+    snippet = str(row.get("description") or row.get("snippet") or "").strip()
+    if title:
+        return False
+    if not snippet:
+        return True
+
+    lowered = snippet.lower()
+    if "enable javascript" in lowered or "javascript is required" in lowered:
+        return True
+    if re.search(r"<(script|meta|html|body|div)\b", lowered):
+        return True
+    return len(snippet) < 48
+
+
+def _has_useful_content(row: dict[str, str]) -> bool:
+    if row.get("error"):
+        return False
+    if str(row.get("title") or "").strip():
+        return True
+    if len(str(row.get("description") or "").strip()) >= 24:
+        return True
+    return len(str(row.get("snippet") or "").strip()) >= 80
+
+
+def _fetch_link_deep(
+    url: str,
+    timeout_seconds: int = 8,
+    max_chars: int = 12000,
+    *,
+    fetch_mode: str = "auto",
+    browser_domains: list[str] | None = None,
+    wait_after_load_ms: int = 1200,
+    browser_fetcher: _BrowserFetcher | None = None,
+) -> dict[str, str]:
+    pre_row, validation_error = _validate_fetch_url(url)
+    if validation_error:
+        pre_row["error"] = validation_error[:200]
+        return pre_row
+
+    mode = (fetch_mode or "auto").strip().lower()
+    if mode not in {"http", "browser", "auto"}:
+        mode = "auto"
+
+    domain = pre_row.get("domain") or ""
+
+    def _http() -> dict[str, str]:
+        row = _fetch_link_http(url, timeout_seconds=timeout_seconds, max_chars=max_chars)
+        if not row.get("domain") and domain:
+            row["domain"] = domain
+        return row
+
+    def _browser() -> dict[str, str]:
+        row = _fetch_link_browser(
+            url,
+            timeout_seconds=timeout_seconds,
+            max_chars=max_chars,
+            wait_after_load_ms=wait_after_load_ms,
+            browser_fetcher=browser_fetcher,
+        )
+        if not row.get("domain") and domain:
+            row["domain"] = domain
+        return row
+
+    if mode == "http":
+        return _http()
+    if mode == "browser":
+        return _browser()
+
+    http_row = _http()
+    force_browser = _host_matches(domain, browser_domains)
+    if force_browser or _is_low_quality_result(http_row):
+        browser_row = _browser()
+        if _has_useful_content(browser_row):
+            return browser_row
+        if not browser_row.get("error") and _is_low_quality_result(http_row):
+            return browser_row
+    return http_row
+
+
 @contextmanager
 def _file_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +487,9 @@ def _build(
     deep_max_links: int = 8,
     deep_timeout_seconds: int = 8,
     deep_max_chars_per_page: int = 12000,
+    deep_fetch_mode: str = "auto",
+    deep_browser_domains: list[str] | None = None,
+    deep_wait_after_load_ms: int = 1200,
 ) -> DailyBuild:
     message_count = len(events)
     all_text = []
@@ -268,14 +570,29 @@ def _build(
     summary_lines.extend([f"- {e}" for e in top_entities] or ["- (none)"])
 
     if deep_enabled and links_seen:
-        for url in sorted(links_seen.keys())[: max(deep_max_links, 1)]:
-            deep_rows.append(
-                _fetch_link_deep(
-                    url,
-                    timeout_seconds=deep_timeout_seconds,
-                    max_chars=deep_max_chars_per_page,
+        urls = sorted(links_seen.keys())[: max(deep_max_links, 1)]
+        needs_browser_session = (deep_fetch_mode in {"browser", "auto"})
+        browser_fetcher = (
+            _BrowserFetcher(timeout_seconds=deep_timeout_seconds, wait_after_load_ms=deep_wait_after_load_ms)
+            if needs_browser_session
+            else None
+        )
+        try:
+            for url in urls:
+                deep_rows.append(
+                    _fetch_link_deep(
+                        url,
+                        timeout_seconds=deep_timeout_seconds,
+                        max_chars=deep_max_chars_per_page,
+                        fetch_mode=deep_fetch_mode,
+                        browser_domains=deep_browser_domains,
+                        wait_after_load_ms=deep_wait_after_load_ms,
+                        browser_fetcher=browser_fetcher,
+                    )
                 )
-            )
+        finally:
+            if browser_fetcher is not None:
+                browser_fetcher.close()
 
     if deep_rows:
         summary_lines += ["", "## Deep Link Context"]
@@ -602,6 +919,9 @@ def main() -> int:
                 deep_max_links=int(deep_cfg.max_links_per_day) if deep_cfg else 8,
                 deep_timeout_seconds=int(deep_cfg.timeout_seconds) if deep_cfg else 8,
                 deep_max_chars_per_page=int(deep_cfg.max_chars_per_page) if deep_cfg else 12000,
+                deep_fetch_mode=str(deep_cfg.fetch_mode) if deep_cfg else "auto",
+                deep_browser_domains=list(deep_cfg.browser_domains) if deep_cfg else [],
+                deep_wait_after_load_ms=int(deep_cfg.wait_after_load_ms) if deep_cfg else 1200,
             )
             write_daily_outputs(
                 root=root,

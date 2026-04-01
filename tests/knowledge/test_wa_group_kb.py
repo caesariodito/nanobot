@@ -189,6 +189,9 @@ def test_parse_group_config_deep_mode_fields() -> None:
                             "maxLinksPerDay": 12,
                             "timeoutSeconds": 9,
                             "maxCharsPerPage": 24000,
+                            "fetchMode": "auto",
+                            "browserDomains": ["instagram.com", "WWW.LinkedIn.com"],
+                            "waitAfterLoadMs": 1800,
                         },
                     }
                 },
@@ -201,6 +204,9 @@ def test_parse_group_config_deep_mode_fields() -> None:
     assert grp.deep_mode.max_links_per_day == 12
     assert grp.deep_mode.timeout_seconds == 9
     assert grp.deep_mode.max_chars_per_page == 24000
+    assert grp.deep_mode.fetch_mode == "auto"
+    assert grp.deep_mode.browser_domains == ["instagram.com", "linkedin.com"]
+    assert grp.deep_mode.wait_after_load_ms == 1800
 
 
 def test_write_daily_outputs_is_idempotent_for_same_day_index(tmp_path: Path) -> None:

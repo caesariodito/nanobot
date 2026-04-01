@@ -218,7 +218,12 @@ def test_daily_script_deep_mode_writes_deep_index(tmp_path: Path, monkeypatch) -
     )
     monkeypatch.setattr(module, "load_config", lambda: cfg)
 
-    def _fake_fetch(url: str, timeout_seconds: int = 8, max_chars: int = 12000):
+    def _fake_fetch(
+        url: str,
+        timeout_seconds: int = 8,
+        max_chars: int = 12000,
+        **kwargs,
+    ):
         return {
             "url": url,
             "status": "200",
@@ -252,6 +257,68 @@ def test_daily_script_deep_mode_writes_deep_index(tmp_path: Path, monkeypatch) -
 
     summary = (root / "daily" / "2026-03-30.md").read_text(encoding="utf-8")
     assert "## Deep Link Context" in summary
+
+
+def test_fetch_link_deep_blocks_localhost_and_private_targets(monkeypatch) -> None:
+    module = _load_module()
+
+    monkeypatch.setattr(module, "_resolve_host_ips", lambda host: {"127.0.0.1"})
+    row = module._fetch_link_deep("http://example.com/internal")
+    assert "blocked target address" in row["error"]
+
+
+
+def test_fetch_link_deep_auto_falls_back_to_browser(monkeypatch) -> None:
+    module = _load_module()
+
+    monkeypatch.setattr(module, "_resolve_host_ips", lambda host: {"93.184.216.34"})
+
+    calls = {"http": 0, "browser": 0}
+
+    def _fake_http(url: str, timeout_seconds: int = 8, max_chars: int = 12000):
+        calls["http"] += 1
+        return {
+            "url": url,
+            "status": "200",
+            "domain": "example.com",
+            "title": "",
+            "description": "",
+            "snippet": "<script>boot</script>",
+            "error": "",
+        }
+
+    def _fake_browser(
+        url: str,
+        timeout_seconds: int = 8,
+        max_chars: int = 12000,
+        *,
+        wait_after_load_ms: int = 1200,
+        browser_fetcher=None,
+    ):
+        calls["browser"] += 1
+        return {
+            "url": url,
+            "status": "200",
+            "domain": "example.com",
+            "title": "Rendered Title",
+            "description": "",
+            "snippet": "Rendered content snippet from hydrated page",
+            "error": "",
+        }
+
+    monkeypatch.setattr(module, "_fetch_link_http", _fake_http)
+    monkeypatch.setattr(module, "_fetch_link_browser", _fake_browser)
+
+    row = module._fetch_link_deep(
+        "https://example.com/article",
+        fetch_mode="auto",
+        browser_domains=[],
+        wait_after_load_ms=1000,
+    )
+
+    assert calls["http"] == 1
+    assert calls["browser"] == 1
+    assert row["title"] == "Rendered Title"
 
 
 
