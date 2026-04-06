@@ -15,6 +15,7 @@ import asyncio
 import html
 import ipaddress
 import json
+import logging
 import re
 import socket
 import urllib.error
@@ -46,6 +47,8 @@ _TOPIC_STOPWORDS = {
 ENTITY_RE = re.compile(r"\b([A-Z][A-Za-z0-9_.-]{2,})\b")
 TASK_RE = re.compile(r"\b(todo|action|follow[- ]?up|next step|deadline|due)\b", re.IGNORECASE)
 DECISION_RE = re.compile(r"\b(decide|decided|agreement|agreed|use\s+\w+|final)\b", re.IGNORECASE)
+
+LOGGER = logging.getLogger("wa_kb_daily")
 
 
 @dataclass(slots=True)
@@ -245,6 +248,12 @@ def _fetch_link_http(url: str, timeout_seconds: int = 8, max_chars: int = 12000)
         return row
     except Exception as exc:
         row["error"] = str(exc)[:200]
+        LOGGER.warning(
+            "wa-kb deep http fetch failed: url=%s domain=%s error=%s",
+            url,
+            row.get("domain", ""),
+            row["error"],
+        )
         return row
 
 
@@ -283,6 +292,12 @@ class _BrowserFetcher:
             self._ensure_started()
         except Exception as exc:
             row["error"] = f"browser init failed: {exc}"[:200]
+            LOGGER.warning(
+                "wa-kb deep browser init failed: url=%s domain=%s error=%s",
+                url,
+                row.get("domain", ""),
+                row["error"],
+            )
             return row
 
         try:
@@ -330,6 +345,12 @@ class _BrowserFetcher:
             return row
         except Exception as exc:
             row["error"] = str(exc)[:200]
+            LOGGER.warning(
+                "wa-kb deep browser fetch failed: url=%s domain=%s error=%s",
+                url,
+                row.get("domain", ""),
+                row["error"],
+            )
             return row
 
     def close(self) -> None:
@@ -411,6 +432,12 @@ def _fetch_link_deep(
     pre_row, validation_error = _validate_fetch_url(url)
     if validation_error:
         pre_row["error"] = validation_error[:200]
+        LOGGER.warning(
+            "wa-kb deep fetch blocked by validation: url=%s domain=%s error=%s",
+            url,
+            pre_row.get("domain", ""),
+            pre_row["error"],
+        )
         return pre_row
 
     mode = (fetch_mode or "auto").strip().lower()
@@ -439,17 +466,49 @@ def _fetch_link_deep(
 
     if mode == "http":
         return _http()
+
     if mode == "browser":
-        return _browser()
+        browser_row = _browser()
+        if browser_row.get("error"):
+            LOGGER.warning(
+                "wa-kb deep browser mode failed; falling back to http: url=%s domain=%s error=%s",
+                url,
+                domain,
+                browser_row.get("error", ""),
+            )
+            return _http()
+        return browser_row
 
     http_row = _http()
+    low_quality_http = _is_low_quality_result(http_row)
     force_browser = _host_matches(domain, browser_domains)
-    if force_browser or _is_low_quality_result(http_row):
+    if force_browser or low_quality_http:
+        reason = "domain_policy" if force_browser else "low_quality_http"
+        LOGGER.info(
+            "wa-kb deep auto mode trying browser: url=%s domain=%s reason=%s",
+            url,
+            domain,
+            reason,
+        )
+
         browser_row = _browser()
         if _has_useful_content(browser_row):
             return browser_row
-        if not browser_row.get("error") and _is_low_quality_result(http_row):
-            return browser_row
+
+        if browser_row.get("error"):
+            LOGGER.warning(
+                "wa-kb deep auto browser failed; keeping http result: url=%s domain=%s error=%s",
+                url,
+                domain,
+                browser_row.get("error", ""),
+            )
+        else:
+            LOGGER.warning(
+                "wa-kb deep auto browser low-value; keeping http result: url=%s domain=%s",
+                url,
+                domain,
+            )
+
     return http_row
 
 
@@ -877,6 +936,11 @@ def _maybe_send_recap(*, workspace: Path, group_id: str, day: date, built: Daily
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[wa-kb] %(levelname)s %(message)s",
+    )
+
     ap = argparse.ArgumentParser(description="Build daily WhatsApp group knowledge markdown files")
     ap.add_argument("--workspace", default="~/.nanobot/workspace")
     ap.add_argument("--group-id", required=True)

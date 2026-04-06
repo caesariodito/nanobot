@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import importlib.util
 import sys
 from pathlib import Path
@@ -268,7 +269,7 @@ def test_fetch_link_deep_blocks_localhost_and_private_targets(monkeypatch) -> No
 
 
 
-def test_fetch_link_deep_auto_falls_back_to_browser(monkeypatch) -> None:
+def test_fetch_link_deep_auto_falls_back_to_browser(monkeypatch, caplog) -> None:
     module = _load_module()
 
     monkeypatch.setattr(module, "_resolve_host_ips", lambda host: {"93.184.216.34"})
@@ -309,6 +310,7 @@ def test_fetch_link_deep_auto_falls_back_to_browser(monkeypatch) -> None:
     monkeypatch.setattr(module, "_fetch_link_http", _fake_http)
     monkeypatch.setattr(module, "_fetch_link_browser", _fake_browser)
 
+    caplog.set_level(logging.INFO, logger="wa_kb_daily")
     row = module._fetch_link_deep(
         "https://example.com/article",
         fetch_mode="auto",
@@ -319,7 +321,55 @@ def test_fetch_link_deep_auto_falls_back_to_browser(monkeypatch) -> None:
     assert calls["http"] == 1
     assert calls["browser"] == 1
     assert row["title"] == "Rendered Title"
+    assert "auto mode trying browser" in caplog.text
 
+
+
+def test_fetch_link_deep_browser_mode_logs_and_falls_back_to_http(monkeypatch, caplog) -> None:
+    module = _load_module()
+
+    monkeypatch.setattr(module, "_resolve_host_ips", lambda host: {"93.184.216.34"})
+
+    def _fake_http(url: str, timeout_seconds: int = 8, max_chars: int = 12000):
+        return {
+            "url": url,
+            "status": "200",
+            "domain": "example.com",
+            "title": "HTTP Title",
+            "description": "",
+            "snippet": "http snippet",
+            "error": "",
+        }
+
+    def _fake_browser(
+        url: str,
+        timeout_seconds: int = 8,
+        max_chars: int = 12000,
+        *,
+        wait_after_load_ms: int = 1200,
+        browser_fetcher=None,
+    ):
+        return {
+            "url": url,
+            "status": "",
+            "domain": "example.com",
+            "title": "",
+            "description": "",
+            "snippet": "",
+            "error": "browser init failed: missing libs",
+        }
+
+    monkeypatch.setattr(module, "_fetch_link_http", _fake_http)
+    monkeypatch.setattr(module, "_fetch_link_browser", _fake_browser)
+
+    caplog.set_level(logging.INFO, logger="wa_kb_daily")
+    row = module._fetch_link_deep(
+        "https://example.com/browser-only",
+        fetch_mode="browser",
+    )
+
+    assert row["title"] == "HTTP Title"
+    assert "browser mode failed; falling back to http" in caplog.text
 
 
 def test_daily_script_skips_recap_when_not_enabled(tmp_path: Path, monkeypatch) -> None:
