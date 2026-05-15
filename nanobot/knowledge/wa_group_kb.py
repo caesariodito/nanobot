@@ -25,8 +25,11 @@ class WAGroupKnowledgeDeepMode:
     timeout_seconds: int = 8
     max_chars_per_page: int = 12000
     fetch_mode: str = "auto"
+    fetch_provider: str = "local"
     browser_domains: list[str] = field(default_factory=list)
     wait_after_load_ms: int = 1200
+    tinyfish_api_key_file: str = "~/.nanobot/secrets/tinyfish_api_key"
+    tinyfish_fallback_to_local: bool = True
 
 
 @dataclass(slots=True)
@@ -109,6 +112,9 @@ def _parse_group_config(group_id: str, raw: Any) -> WAGroupKnowledgeGroup | None
     fetch_mode_raw = str(deep_raw.get("fetchMode", deep_raw.get("fetch_mode", "auto")) or "auto").strip().lower()
     fetch_mode = fetch_mode_raw if fetch_mode_raw in {"http", "browser", "auto"} else "auto"
 
+    fetch_provider_raw = str(deep_raw.get("fetchProvider", deep_raw.get("fetch_provider", "local")) or "local").strip().lower()
+    fetch_provider = fetch_provider_raw if fetch_provider_raw in {"local", "tinyfish"} else "local"
+
     browser_domains_raw = deep_raw.get("browserDomains", deep_raw.get("browser_domains", []))
     browser_domains: list[str] = []
     if isinstance(browser_domains_raw, list):
@@ -125,8 +131,11 @@ def _parse_group_config(group_id: str, raw: Any) -> WAGroupKnowledgeGroup | None
         timeout_seconds=_safe_int(deep_raw.get("timeoutSeconds", deep_raw.get("timeout_seconds", 8)), 8, 2, 30),
         max_chars_per_page=_safe_int(deep_raw.get("maxCharsPerPage", deep_raw.get("max_chars_per_page", 12000)), 12000, 1000, 100000),
         fetch_mode=fetch_mode,
+        fetch_provider=fetch_provider,
         browser_domains=browser_domains,
         wait_after_load_ms=_safe_int(deep_raw.get("waitAfterLoadMs", deep_raw.get("wait_after_load_ms", 1200)), 1200, 0, 10000),
+        tinyfish_api_key_file=str(deep_raw.get("tinyfishApiKeyFile", deep_raw.get("tinyfish_api_key_file", "~/.nanobot/secrets/tinyfish_api_key")) or "~/.nanobot/secrets/tinyfish_api_key"),
+        tinyfish_fallback_to_local=bool(deep_raw.get("tinyfishFallbackToLocal", deep_raw.get("tinyfish_fallback_to_local", True))),
     )
 
     return WAGroupKnowledgeGroup(

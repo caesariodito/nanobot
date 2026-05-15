@@ -16,6 +16,7 @@ import html
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import urllib.error
@@ -131,7 +132,10 @@ def _normalize_host(host: str) -> str:
 def _host_matches(domain: str, candidates: list[str] | None) -> bool:
     host = _normalize_host(domain)
     for item in candidates or []:
-        candidate = _normalize_host(str(item or ""))
+        raw = str(item or "").strip()
+        if raw == "*":
+            return bool(host)
+        candidate = _normalize_host(raw)
         if not candidate:
             continue
         if host == candidate or host.endswith("." + candidate):
@@ -419,15 +423,102 @@ def _has_useful_content(row: dict[str, str]) -> bool:
     return len(str(row.get("snippet") or "").strip()) >= 80
 
 
+def _load_tinyfish_api_key(api_key_file: str | None = None) -> str:
+    env_key = str(os.environ.get("TINYFISH_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+
+    path_raw = str(api_key_file or "~/.nanobot/secrets/tinyfish_api_key").strip()
+    if not path_raw:
+        return ""
+    path = Path(path_raw).expanduser()
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        LOGGER.warning("wa-kb deep tinyfish key file unreadable: path=%s error=%s", path, exc)
+        return ""
+
+
+def _coerce_tinyfish_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _fetch_link_tinyfish(url: str, api_key: str, timeout_seconds: int = 8, max_chars: int = 12000) -> dict[str, str]:
+    row = _new_deep_row(url)
+    if not api_key:
+        row["error"] = "tinyfish api key missing"
+        LOGGER.warning("wa-kb deep tinyfish key missing: url=%s domain=%s", url, row.get("domain", ""))
+        return row
+
+    body = json.dumps({"urls": [url], "format": "markdown"}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.fetch.tinyfish.ai",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-API-Key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:  # nosec B310
+            row["status"] = str(resp.status)
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        row["status"] = str(exc.code)
+        row["error"] = f"tinyfish http {exc.code}"
+        return row
+    except Exception as exc:
+        row["error"] = f"tinyfish {type(exc).__name__}: {exc}"[:200]
+        return row
+
+    results = payload.get("results") if isinstance(payload, dict) else None
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if isinstance(results, list) and results:
+        item = results[0] if isinstance(results[0], dict) else {}
+        final_url = str(item.get("final_url") or item.get("url") or url)
+        row["url"] = final_url or url
+        parsed = urlparse(final_url or url)
+        row["domain"] = _normalize_host(parsed.netloc) or row.get("domain", "")
+        row["title"] = str(item.get("title") or "").strip()[:300]
+        row["description"] = str(item.get("description") or "").strip()[:500]
+        text = _coerce_tinyfish_text(item.get("text"))
+        row["snippet"] = _clean_text(text)[:max_chars]
+        return row
+
+    if isinstance(errors, list) and errors:
+        err = errors[0]
+        if isinstance(err, dict):
+            row["error"] = str(err.get("error") or err.get("message") or err)[:200]
+        else:
+            row["error"] = str(err)[:200]
+    else:
+        row["error"] = "tinyfish empty response"
+    return row
+
+
 def _fetch_link_deep(
     url: str,
     timeout_seconds: int = 8,
     max_chars: int = 12000,
     *,
     fetch_mode: str = "auto",
+    fetch_provider: str = "local",
     browser_domains: list[str] | None = None,
     wait_after_load_ms: int = 1200,
     browser_fetcher: _BrowserFetcher | None = None,
+    tinyfish_api_key: str = "",
+    tinyfish_fallback_to_local: bool = True,
 ) -> dict[str, str]:
     pre_row, validation_error = _validate_fetch_url(url)
     if validation_error:
@@ -443,6 +534,9 @@ def _fetch_link_deep(
     mode = (fetch_mode or "auto").strip().lower()
     if mode not in {"http", "browser", "auto"}:
         mode = "auto"
+    provider = (fetch_provider or "local").strip().lower()
+    if provider not in {"local", "tinyfish"}:
+        provider = "local"
 
     domain = pre_row.get("domain") or ""
 
@@ -464,8 +558,64 @@ def _fetch_link_deep(
             row["domain"] = domain
         return row
 
+    def _tinyfish() -> dict[str, str]:
+        row = _fetch_link_tinyfish(url, tinyfish_api_key, timeout_seconds=timeout_seconds, max_chars=max_chars)
+        if not row.get("domain") and domain:
+            row["domain"] = domain
+        return row
+
     if mode == "http":
         return _http()
+
+    if provider == "tinyfish":
+        if mode == "browser":
+            tinyfish_row = _tinyfish()
+            if _has_useful_content(tinyfish_row):
+                LOGGER.info("wa-kb deep tinyfish succeeded: url=%s domain=%s mode=browser", url, domain)
+                return tinyfish_row
+            LOGGER.warning(
+                "wa-kb deep tinyfish failed or low-value: url=%s domain=%s mode=browser error=%s",
+                url,
+                domain,
+                tinyfish_row.get("error", ""),
+            )
+            if tinyfish_fallback_to_local:
+                browser_row = _browser()
+                if _has_useful_content(browser_row):
+                    return browser_row
+            return _http()
+
+        http_row = _http()
+        low_quality_http = _is_low_quality_result(http_row)
+        force_tinyfish = _host_matches(domain, browser_domains)
+        if force_tinyfish or low_quality_http:
+            reason = "domain_policy" if force_tinyfish else "low_quality_http"
+            LOGGER.info("wa-kb deep auto mode trying tinyfish: url=%s domain=%s reason=%s", url, domain, reason)
+            tinyfish_row = _tinyfish()
+            if _has_useful_content(tinyfish_row):
+                LOGGER.info("wa-kb deep tinyfish succeeded: url=%s domain=%s reason=%s", url, domain, reason)
+                return tinyfish_row
+            LOGGER.warning(
+                "wa-kb deep tinyfish failed or low-value: url=%s domain=%s reason=%s error=%s",
+                url,
+                domain,
+                reason,
+                tinyfish_row.get("error", ""),
+            )
+            if tinyfish_fallback_to_local:
+                browser_row = _browser()
+                if _has_useful_content(browser_row):
+                    return browser_row
+                if browser_row.get("error"):
+                    LOGGER.warning(
+                        "wa-kb deep auto browser fallback failed; keeping http result: url=%s domain=%s error=%s",
+                        url,
+                        domain,
+                        browser_row.get("error", ""),
+                    )
+                else:
+                    LOGGER.warning("wa-kb deep auto browser fallback low-value; keeping http result: url=%s domain=%s", url, domain)
+        return http_row
 
     if mode == "browser":
         browser_row = _browser()
@@ -547,8 +697,11 @@ def _build(
     deep_timeout_seconds: int = 8,
     deep_max_chars_per_page: int = 12000,
     deep_fetch_mode: str = "auto",
+    deep_fetch_provider: str = "local",
     deep_browser_domains: list[str] | None = None,
     deep_wait_after_load_ms: int = 1200,
+    deep_tinyfish_api_key: str = "",
+    deep_tinyfish_fallback_to_local: bool = True,
 ) -> DailyBuild:
     message_count = len(events)
     all_text = []
@@ -630,7 +783,8 @@ def _build(
 
     if deep_enabled and links_seen:
         urls = sorted(links_seen.keys())[: max(deep_max_links, 1)]
-        needs_browser_session = (deep_fetch_mode in {"browser", "auto"})
+        provider = (deep_fetch_provider or "local").strip().lower()
+        needs_browser_session = provider == "local" and deep_fetch_mode in {"browser", "auto"}
         browser_fetcher = (
             _BrowserFetcher(timeout_seconds=deep_timeout_seconds, wait_after_load_ms=deep_wait_after_load_ms)
             if needs_browser_session
@@ -644,9 +798,12 @@ def _build(
                         timeout_seconds=deep_timeout_seconds,
                         max_chars=deep_max_chars_per_page,
                         fetch_mode=deep_fetch_mode,
+                        fetch_provider=deep_fetch_provider,
                         browser_domains=deep_browser_domains,
                         wait_after_load_ms=deep_wait_after_load_ms,
                         browser_fetcher=browser_fetcher,
+                        tinyfish_api_key=deep_tinyfish_api_key,
+                        tinyfish_fallback_to_local=deep_tinyfish_fallback_to_local,
                     )
                 )
         finally:
@@ -984,8 +1141,11 @@ def main() -> int:
                 deep_timeout_seconds=int(deep_cfg.timeout_seconds) if deep_cfg else 8,
                 deep_max_chars_per_page=int(deep_cfg.max_chars_per_page) if deep_cfg else 12000,
                 deep_fetch_mode=str(deep_cfg.fetch_mode) if deep_cfg else "auto",
+                deep_fetch_provider=str(deep_cfg.fetch_provider) if deep_cfg else "local",
                 deep_browser_domains=list(deep_cfg.browser_domains) if deep_cfg else [],
                 deep_wait_after_load_ms=int(deep_cfg.wait_after_load_ms) if deep_cfg else 1200,
+                deep_tinyfish_api_key=_load_tinyfish_api_key(str(deep_cfg.tinyfish_api_key_file)) if deep_cfg else "",
+                deep_tinyfish_fallback_to_local=bool(deep_cfg.tinyfish_fallback_to_local) if deep_cfg else True,
             )
             write_daily_outputs(
                 root=root,
