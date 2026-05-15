@@ -1,11 +1,12 @@
 """Message tool for sending messages to users."""
 
-import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import ContextAware, RequestContext
+from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
@@ -13,12 +14,24 @@ from nanobot.config.paths import get_workspace_path
 
 @tool_parameters(
     tool_parameters_schema(
-        content=StringSchema("The message content to send"),
-        channel=StringSchema("Optional: target channel (telegram, discord, etc.)"),
-        chat_id=StringSchema("Optional: target chat/user ID"),
+        content=StringSchema(
+            "Message content for proactive or cross-channel delivery. "
+            "Do not use this for a normal reply in the current chat."
+        ),
+        channel=StringSchema(
+            "Optional target channel for cross-channel/proactive delivery. "
+            "Do not set this to the current runtime channel for a normal reply."
+        ),
+        chat_id=StringSchema(
+            "Optional target chat/user ID for cross-channel/proactive delivery. "
+            "Do not set this to the current runtime chat for a normal reply."
+        ),
         media=ArraySchema(
             StringSchema(""),
-            description="Optional: list of file paths to attach (images, video, audio, documents)",
+            description=(
+                "Optional list of existing file paths to attach for proactive or cross-channel delivery. "
+                "Do not use this to resend generate_image outputs in the current chat."
+            ),
         ),
         buttons=ArraySchema(
             ArraySchema(StringSchema("Button label")),
@@ -27,7 +40,7 @@ from nanobot.config.paths import get_workspace_path
         required=["content"],
     )
 )
-class MessageTool(Tool):
+class MessageTool(Tool, ContextAware):
     """Tool to send messages to users on chat channels."""
 
     def __init__(
@@ -37,11 +50,19 @@ class MessageTool(Tool):
         default_chat_id: str = "",
         default_message_id: str | None = None,
         workspace: str | Path | None = None,
+        restrict_to_workspace: bool = False,
     ):
         self._send_callback = send_callback
-        self._workspace = Path(workspace).expanduser() if workspace is not None else get_workspace_path()
-        self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
-        self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
+        self._workspace = (
+            Path(workspace).expanduser() if workspace is not None else get_workspace_path()
+        )
+        self._restrict_to_workspace = restrict_to_workspace
+        self._default_channel: ContextVar[str] = ContextVar(
+            "message_default_channel", default=default_channel
+        )
+        self._default_chat_id: ContextVar[str] = ContextVar(
+            "message_default_chat_id", default=default_chat_id
+        )
         self._default_message_id: ContextVar[str | None] = ContextVar(
             "message_default_message_id",
             default=default_message_id,
@@ -56,18 +77,21 @@ class MessageTool(Tool):
             default=False,
         )
 
-    def set_context(
-        self,
-        channel: str,
-        chat_id: str,
-        message_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        send_callback = ctx.bus.publish_outbound if ctx.bus else None
+        return cls(
+            send_callback=send_callback,
+            workspace=ctx.workspace,
+            restrict_to_workspace=ctx.config.restrict_to_workspace,
+        )
+
+    def set_context(self, ctx: RequestContext) -> None:
         """Set the current message context."""
-        self._default_channel.set(channel)
-        self._default_chat_id.set(chat_id)
-        self._default_message_id.set(message_id)
-        self._default_metadata.set(metadata or {})
+        self._default_channel.set(ctx.channel)
+        self._default_chat_id.set(ctx.chat_id)
+        self._default_message_id.set(ctx.message_id)
+        self._default_metadata.set(dict(ctx.metadata or {}))
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -100,11 +124,30 @@ class MessageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Send a message to the user, optionally with file attachments. "
-            "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
+            "Proactively send a message to a user/channel, optionally with file attachments. "
+            "Use this for reminders, cross-channel delivery, or explicit proactive sends. "
+            "Do not use this for the normal reply in the current chat: answer naturally instead. "
+            "If channel/chat_id would target the current runtime conversation, do not call this tool "
+            "unless the user explicitly asked you to proactively send an existing file attachment. "
+            "When generate_image creates images in the current chat, the final assistant reply "
+            "automatically attaches them; do not call message just to announce or resend them. "
+            "For proactive attachment delivery, use the 'media' parameter with file paths. "
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
+
+    def _resolve_media(self, media: list[str]) -> list[str]:
+        """Resolve local media attachments and enforce workspace restriction when enabled."""
+        resolved: list[str] = []
+        allowed_dir = self._workspace if self._restrict_to_workspace else None
+        for p in media:
+            if p.startswith(("http://", "https://")):
+                resolved.append(p)
+            elif not self._restrict_to_workspace:
+                path = Path(p).expanduser()
+                resolved.append(p if path.is_absolute() else str(self._workspace / path))
+            else:
+                resolved.append(str(resolve_workspace_path(p, self._workspace, allowed_dir)))
+        return resolved
 
     async def execute(
         self,
@@ -114,9 +157,10 @@ class MessageTool(Tool):
         message_id: str | None = None,
         media: list[str] | None = None,
         buttons: list[list[str]] | None = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> str:
         from nanobot.utils.helpers import strip_think
+
         content = strip_think(content)
 
         if buttons is not None:
@@ -147,18 +191,15 @@ class MessageTool(Tool):
             return "Error: Message sending not configured"
 
         if media:
-            resolved = []
-            for p in media:
-                if p.startswith(("http://", "https://")) or os.path.isabs(p):
-                    resolved.append(p)
-                else:
-                    resolved.append(str(self._workspace / p))
-            media = resolved
+            try:
+                media = self._resolve_media(media)
+            except (OSError, PermissionError, ValueError) as e:
+                return f"Error: media path is not allowed: {str(e)}"
 
         metadata = dict(self._default_metadata.get()) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
-        if self._record_channel_delivery_var.get():
+        if self._record_channel_delivery_var.get() or media:
             metadata["_record_channel_delivery"] = True
 
         msg = OutboundMessage(
