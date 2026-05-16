@@ -493,7 +493,7 @@ def _fetch_link_tinyfish(url: str, api_key: str, timeout_seconds: int = 8, max_c
         row["title"] = str(item.get("title") or "").strip()[:300]
         row["description"] = str(item.get("description") or "").strip()[:500]
         text = _coerce_tinyfish_text(item.get("text"))
-        row["snippet"] = _clean_text(text)[:max_chars]
+        row["snippet"] = re.sub(r"\s+", " ", text).strip()[: min(max_chars, 5000)]
         return row
 
     if isinstance(errors, list) and errors:
